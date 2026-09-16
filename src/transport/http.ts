@@ -657,8 +657,9 @@ export async function startHttpTransport(
         transport.close().catch(() => {});
         server.close().catch(() => {});
       });
-    } catch (error) {
-      logger.error({ error }, "Error handling MCP request");
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      logger.error({ error: message }, "Error handling MCP request");
       if (!res.headersSent) {
         res.status(500).json({
           jsonrpc: "2.0",

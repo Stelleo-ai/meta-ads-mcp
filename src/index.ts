@@ -39,7 +39,8 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((error) => {
-  logger.fatal({ error }, "Failed to start server");
+main().catch((err) => {
+  const message = err instanceof Error ? err.message : String(err);
+  logger.fatal({ error: message }, "Failed to start server");
   process.exit(1);
 });

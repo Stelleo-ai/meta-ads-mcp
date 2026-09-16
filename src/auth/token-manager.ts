@@ -42,7 +42,8 @@ export class TokenManager {
           );
         }
       } catch (err) {
-        logger.error({ error: err }, "Failed to parse META_TOKENS JSON");
+        const message = err instanceof Error ? err.message : String(err);
+        logger.error({ error: message }, "Failed to parse META_TOKENS JSON");
       }
     }
 
