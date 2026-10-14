@@ -1,6 +1,8 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { metaApiClient } from "../meta/client.js";
+import { statedAmounts } from "../meta/account-currency.js";
+import { MINOR_UNIT_NOTE } from "../meta/currency.js";
 import { normalizeAccountId, validateMetaId } from "../utils/format.js";
 import { buildFieldsParam } from "../utils/validation.js";
 import { ADSET_DEFAULT_FIELDS } from "../meta/types/adset.js";
@@ -9,6 +11,7 @@ import { CREATIVE_DEFAULT_FIELDS } from "../meta/types/creative.js";
 import type { Ad, AdCreative, AdSet, GeoLocation, MetaApiResponse, TargetingSpec } from "../meta/types/index.js";
 import { READ, CREATE, UPDATE, DELETE, WRITE_WARNING } from "./_register.js";
 import { getCloneBundleStore, STALE_IN_PROGRESS_MS } from "../store/clone-bundle-store.js";
+import { adaptCopiedTargetingForCreate } from "../meta/targeting-compat.js";
 import { ctaEnum } from "./creatives.js";
 
 const statusEnum = z.enum(["ACTIVE", "PAUSED", "DELETED", "ARCHIVED"]);
@@ -99,22 +102,22 @@ const targetingSchema = z
     wireless_carrier: z.array(z.string()).optional().describe("Carrier targeting (use 'Wifi' for wifi-only users)"),
 
     publisher_platforms: z.array(z.string()).optional().describe("facebook, instagram, threads, messenger, audience_network"),
-    facebook_positions: z.array(z.string()).optional().describe("feed, right_hand_column, marketplace, video_feeds, story, search, instream_video, facebook_reels, facebook_reels_overlay, profile_feed, notification"),
-    instagram_positions: z.array(z.string()).optional().describe("stream, story, explore, explore_home, reels, profile_feed, ig_search, profile_reels"),
+    facebook_positions: z.array(z.string()).optional().describe("feed, right_hand_column, marketplace, story, search, instream_video, facebook_reels, facebook_reels_overlay, profile_feed, notification. Do not use video_feeds: Meta removed it in Marketing API v24.0 and rejects it (use facebook_reels instead)."),
+    instagram_positions: z.array(z.string()).optional().describe("stream, story, explore_home, reels, profile_feed, ig_search, profile_reels. Do not use explore: Meta removed the Instagram Explore Feed placement in Marketing API v26.0 and rejects it."),
     threads_positions: z.array(z.string()).optional().describe("threads_stream (requires instagram stream)"),
     audience_network_positions: z.array(z.string()).optional().describe("classic, rewarded_video"),
-    messenger_positions: z.array(z.string()).optional().describe("sponsored_messages, story"),
+    messenger_positions: z.array(z.string()).optional().describe("sponsored_messages. Do not use story: Meta removed Messenger Stories in Marketing API v26.0 and silently drops it."),
     whatsapp_positions: z.array(z.string()).optional().describe("status (requires instagram story)"),
 
     brand_safety_content_filter_levels: z.array(z.string()).optional().describe("FACEBOOK_RELAXED/STANDARD/STRICT, AN_RELAXED/STANDARD/STRICT, FEED_RELAXED/STANDARD/STRICT"),
     excluded_publisher_categories: z.array(z.string()).optional().describe("dating, gambling, debated_social_issues, mature_audiences, tragedy_and_conflict"),
     excluded_publisher_list_ids: z.array(z.string()).optional().describe("Block list IDs to exclude specific publishers"),
 
-    flexible_spec: z.array(z.record(z.unknown())).optional().describe("Array of targeting groups combined with AND; items within each group use OR"),
-    exclusions: z.record(z.unknown()).optional(),
+    flexible_spec: z.array(z.record(z.string(), z.unknown())).optional().describe("Array of targeting groups combined with AND; items within each group use OR"),
+    exclusions: z.record(z.string(), z.unknown()).optional(),
 
     targeting_automation: z.object({
-      advantage_audience: z.number().optional().describe("1 to enable Advantage+ audience"),
+      advantage_audience: z.number().optional().describe("1 to enable Advantage+ audience, 0 to opt out. Meta requires an explicit 1 or 0 when creating an ad set whose age, gender, custom audiences or detailed targeting are not default and not relaxed (Marketing API v23.0+, and v26.0+ for Housing, Employment and Financial Products and Services campaigns). Default or relaxed setups default to 1."),
     }).passthrough().optional().describe("Advantage+ audience automation settings"),
   })
   .passthrough()
@@ -126,11 +129,11 @@ const cloneTargetAdSetSchema = z.object({
   name: z.string().min(1).describe("Name for the cloned ad set"),
   geo_override: geoLocationSchema.describe("Geo override that REPLACES the source geo_locations (for example, { countries: ['CL'] }). Cities/regions/zips from the source are NOT inherited."),
   status: z.enum(["ACTIVE", "PAUSED"]).default("PAUSED").describe("Status for the cloned ad set and ads. Defaults to PAUSED."),
-  daily_budget: z.number().optional().describe("Optional daily budget override in cents. Takes precedence over the source budget, regardless of source budget type."),
-  lifetime_budget: z.number().optional().describe("Optional lifetime budget override in cents. Requires end_time."),
+  daily_budget: z.number().optional().describe(`Optional daily budget override ${MINOR_UNIT_NOTE}. Takes precedence over the source budget, regardless of source budget type.`),
+  lifetime_budget: z.number().optional().describe("Optional lifetime budget override, in the same unit as daily_budget. Requires end_time."),
   end_time: z.string().optional().describe("ISO 8601 end time. Required when lifetime_budget is set."),
   destination_type: destinationTypeEnum.optional().describe("Optional destination_type override"),
-  promoted_object: z.record(z.unknown()).optional().describe("Optional promoted_object override"),
+  promoted_object: z.record(z.string(), z.unknown()).optional().describe("Optional promoted_object override"),
 });
 
 const creativeOverrideSchema = z.object({
@@ -403,7 +406,7 @@ export function registerAdSetTools(server: McpServer): void {
   server.registerTool(
     "ads_clone_ad_set_bundle",
     {
-      description: `${WRITE_WARNING}Clone an ad set bundle in one operation: reads a source ad set, clones its targeting/budget/pixel setup into a new ad set, and recreates every ad by duplicating it with Meta's native ad-copy endpoint (POST /{ad_id}/copies). Native copy gives 100% creative-type coverage — link, image, video, carousel, collection, catalog/Advantage+ catalog, dynamic (asset_feed_spec), and boosted posts all clone losslessly, with the destination ad set's pixel applied automatically. Designed for workflows like duplicating a GEO-specific ad set to another country with a different pixel while keeping every new resource PAUSED by default. creative_overrides change copy per source ad: on standard (object_story_spec) creatives the override is applied by swapping a modified creative onto the copied ad; on dynamic or otherwise non-patchable creatives the override cannot be applied and is reported in warnings while the ad remains in created_ads. If a single ad fails to copy it is reported in skipped and the rest proceed. Supports dry_run planning and idempotency_key-based retry safety.`,
+      description: `${WRITE_WARNING}Clone an ad set bundle in one operation: reads a source ad set, clones its targeting/budget/pixel setup into a new ad set, and recreates every ad by duplicating it with Meta's native ad-copy endpoint (POST /{ad_id}/copies). Native copy gives 100% creative-type coverage — link, image, video, carousel, collection, catalog/Advantage+ catalog, dynamic (asset_feed_spec), and boosted posts all clone losslessly, with the destination ad set's pixel applied automatically. Designed for workflows like duplicating a GEO-specific ad set to another country with a different pixel while keeping every new resource PAUSED by default. creative_overrides change copy per source ad: on standard (object_story_spec) creatives the override is applied by swapping a modified creative onto the copied ad; on dynamic or otherwise non-patchable creatives the override cannot be applied and is reported in warnings while the ad remains in created_ads. If a single ad fails to copy it is reported in skipped and the rest proceed. Supports dry_run planning and idempotency_key-based retry safety. The copied targeting is adapted to the Marketing API version in use before the ad set is created: placements Meta has removed (Facebook video_feeds, Instagram explore, Messenger story) are dropped, and a missing Advantage+ audience setting becomes an explicit opt-out (advantage_audience 0). The clone is refused, before anything is created, when dropping a placement would widen delivery or leave no placements. Every adjustment is listed in warnings, including on dry runs. A creative swapped in by creative_overrides keeps the source creative's destination setting (destination_spec) and WhatsApp Status identity (wamo_whatsapp_identity_spec) when Meta reports them; when it reports none, the new creative sends none and follows Meta's defaults.`,
       inputSchema: {
         account_id: z.string().describe("Ad account ID"),
         source_ad_set_id: z.string().describe("Source ad set ID to clone"),
@@ -491,10 +494,12 @@ export function registerAdSetTools(server: McpServer): void {
         500,
       );
 
-      const warnings: string[] = [];
       const skipped: CloneAdSetBundleSkip[] = [];
 
-      const clonedTargeting = applyGeoOverride(sourceAdSet.targeting, target_ad_set.geo_override);
+      const { targeting: clonedTargeting, warnings } = adaptCopiedTargetingForCreate(
+        applyGeoOverride(sourceAdSet.targeting, target_ad_set.geo_override),
+        metaApiClient.apiVersion,
+      );
       const targetStatus = target_ad_set.status ?? "PAUSED";
       // Force PAUSED unless the caller explicitly asked for ACTIVE — never
       // INHERITED_FROM_SOURCE, which could silently activate a copy of an active ad.
@@ -519,7 +524,7 @@ export function registerAdSetTools(server: McpServer): void {
         let sourceCreative: AdCreative | undefined;
         if (override && sourceCreativeId) {
           sourceCreative = await metaApiClient.get<AdCreative>(`/${sourceCreativeId}`, {
-            fields: buildFieldsParam(undefined, [...CREATIVE_DEFAULT_FIELDS]),
+            fields: buildFieldsParam(undefined, [...CREATIVE_DEFAULT_FIELDS, "destination_spec", "wamo_whatsapp_identity_spec"]),
           });
         }
         adPlans.push({
@@ -726,9 +731,22 @@ export function registerAdSetTools(server: McpServer): void {
           try {
             const patched = buildPatchedObjectStorySpec(plan.sourceCreative, plan.override);
             if (!patched) throw new Error("source creative has no patchable object_story_spec.");
+            const creativeBody: Record<string, string> = {
+              name: plan.override.name ?? plannedName,
+              object_story_spec: JSON.stringify(patched),
+            };
+            // Without it, Marketing API v26.0+ defaults a shop advertiser's new
+            // creative to Website and Shop.
+            if (plan.sourceCreative.destination_spec) {
+              creativeBody.destination_spec = JSON.stringify(plan.sourceCreative.destination_spec);
+            }
+            // v26.0+ no longer defaults the WhatsApp identity for third-party callers.
+            if (plan.sourceCreative.wamo_whatsapp_identity_spec) {
+              creativeBody.wamo_whatsapp_identity_spec = JSON.stringify(plan.sourceCreative.wamo_whatsapp_identity_spec);
+            }
             const newCreative = await metaApiClient.postForm<{ id: string }>(
               `/${accountPath}/adcreatives`,
-              { name: plan.override.name ?? plannedName, object_story_spec: JSON.stringify(patched) },
+              creativeBody,
             );
             createdResources.creativeIds.push(newCreative.id);
             if (cacheKey) await store.update(cacheKey, { createdResources });
@@ -781,11 +799,25 @@ export function registerAdSetTools(server: McpServer): void {
         });
       }
 
+      // Restated from the body that was sent, and only where the caller's
+      // own value is what went into it: a budget or bid copied from the source
+      // ad set is already in this account's unit, and a caller's daily budget
+      // is dropped when a lifetime budget comes with it.
+      const callerLifetime = target_ad_set.lifetime_budget !== undefined;
+      const callerDaily = !callerLifetime && target_ad_set.daily_budget !== undefined;
+      const amountLines = await statedAmounts(
+        {
+          ...(callerLifetime ? { lifetime_budget: createAdSetBody.lifetime_budget } : {}),
+          ...(callerDaily ? { daily_budget: createAdSetBody.daily_budget } : {}),
+        },
+        { accountId: accountPath },
+      );
+
       return {
         content: [
           {
             type: "text",
-            text: `Bundle cloned!\nAd Set: ${target_ad_set.name} (${result.new_ad_set.id})\nAds copied: ${result.created_ads.length}\nOverrides swapped: ${result.created_creatives.length}\nWarnings: ${result.warnings.length}\nSkipped (copy failed): ${result.skipped.length}`,
+            text: `Bundle cloned!\nAd Set: ${target_ad_set.name} (${result.new_ad_set.id})\nAds copied: ${result.created_ads.length}\nOverrides swapped: ${result.created_creatives.length}\nWarnings: ${result.warnings.length}\nSkipped (copy failed): ${result.skipped.length}${amountLines}`,
           },
           { type: "text", text: JSON.stringify(result, null, 2) },
         ],
@@ -797,23 +829,23 @@ export function registerAdSetTools(server: McpServer): void {
   server.registerTool(
     "ads_create_ad_set",
     {
-      description: `${WRITE_WARNING}Create a new ad set within a campaign. Requires targeting specification, optimization goal, and destination_type (required for ODAX campaigns). Budget belongs at exactly one level: when the parent campaign has either daily_budget or lifetime_budget (campaign budget / CBO), omit both ad-set budget fields. Only pass daily_budget or lifetime_budget here for ad-set budget / ABO campaigns. Common destination_type values: WEBSITE (traffic/sales to website), APP (app installs), MESSENGER/WHATSAPP/INSTAGRAM_DIRECT (messaging), ON_AD (lead forms, instant experiences). Ad sets are created in PAUSED status by default.`,
+      description: `${WRITE_WARNING}Create a new ad set within a campaign. Requires targeting specification, optimization goal, and destination_type (required for ODAX campaigns). Budget belongs at exactly one level: when the parent campaign has either daily_budget or lifetime_budget (campaign budget / CBO), omit both ad-set budget fields. Only pass daily_budget or lifetime_budget here for ad-set budget / ABO campaigns. Common destination_type values: WEBSITE (traffic/sales to website), APP (app installs), MESSENGER/WHATSAPP/INSTAGRAM_DIRECT (messaging), ON_AD (lead forms, instant experiences). Ad sets are created in PAUSED status by default. When age, gender, custom audiences or detailed targeting are not default and not relaxed, set targeting.targeting_automation.advantage_audience to 1 or 0 explicitly or Meta rejects the ad set.`,
       inputSchema: {
         account_id: z.string().describe("Ad account ID"),
         campaign_id: z.string().describe("Parent campaign ID"),
         name: z.string().min(1).describe("Ad set name"),
         destination_type: destinationTypeEnum.describe("Where the ad traffic is directed. Required for ODAX campaigns. Common values: WEBSITE (website traffic/conversions), APP (app installs), MESSENGER (Messenger conversations), WHATSAPP (WhatsApp conversations), INSTAGRAM_DIRECT (Instagram DMs), ON_AD (lead forms, instant experiences, post engagement), ON_VIDEO (video views), ON_PAGE (page engagement), SHOP_AUTOMATIC (shop)"),
         status: z.enum(["ACTIVE", "PAUSED"]).default("PAUSED"),
-        daily_budget: z.number().optional().describe("Ad-set daily budget in cents (e.g., 2000 = $20.00). Omit when the parent campaign has a daily or lifetime budget."),
-        lifetime_budget: z.number().optional().describe("Ad-set lifetime budget in cents. Omit when the parent campaign has a daily or lifetime budget."),
+        daily_budget: z.number().optional().describe(`Ad-set daily budget ${MINOR_UNIT_NOTE}. Omit when the parent campaign has a daily or lifetime budget.`),
+        lifetime_budget: z.number().optional().describe("Ad-set lifetime budget, in the same unit as daily_budget. Omit when the parent campaign has a daily or lifetime budget."),
         optimization_goal: optimizationGoalEnum.describe("Optimization goal"),
         billing_event: billingEventEnum.default("IMPRESSIONS"),
-        bid_amount: z.number().optional().describe("Bid cap in cents"),
+        bid_amount: z.number().optional().describe("Bid cap, in the same unit as daily_budget."),
         bid_strategy: bidStrategyEnum.optional(),
         targeting: targetingSchema,
         start_time: z.string().optional().describe("ISO 8601 start time"),
         end_time: z.string().optional().describe("ISO 8601 end time (required for lifetime_budget)"),
-        promoted_object: z.record(z.unknown()).optional().describe("Promoted object (e.g., { page_id: '123' } or { pixel_id: '456', custom_event_type: 'PURCHASE' })"),
+        promoted_object: z.record(z.string(), z.unknown()).optional().describe("Promoted object (e.g., { page_id: '123' } or { pixel_id: '456', custom_event_type: 'PURCHASE' })"),
       },
       annotations: { ...CREATE },
     },
@@ -844,12 +876,13 @@ export function registerAdSetTools(server: McpServer): void {
       if (promoted_object) body.promoted_object = JSON.stringify(promoted_object);
 
       const result = await metaApiClient.postForm<{ id: string }>(`/${accountPath}/adsets`, body);
+      const amountLines = await statedAmounts(body, { accountId: accountPath });
 
       return {
         content: [
           {
             type: "text",
-            text: `Ad set created successfully!\nID: ${result.id}\nName: ${name}\nCampaign: ${campaignIdValidated}\nStatus: ${status}\nOptimization: ${optimization_goal}`,
+            text: `Ad set created successfully!\nID: ${result.id}\nName: ${name}\nCampaign: ${campaignIdValidated}\nStatus: ${status}\nOptimization: ${optimization_goal}${amountLines}`,
           },
         ],
       };
@@ -860,16 +893,16 @@ export function registerAdSetTools(server: McpServer): void {
   server.registerTool(
     "ads_update_ad_set",
     {
-      description: `${WRITE_WARNING}Update an existing ad set in place. Common use cases: change daily_budget or lifetime_budget (values in cents — e.g., 2000 = $20.00), pause/reactivate via status (ACTIVE/PAUSED), extend end_time, replace targeting, adjust bid_amount/bid_strategy, or rename. Only the fields you pass are sent to Meta — omitted fields keep their current value. lifetime_budget requires a corresponding end_time on the ad set. Authentication is handled transparently: the active Meta token is resolved from the request context (Sign in with Meta OAuth, registered System User token, or X-Meta-Token header in service-to-service mode). Note that meaningful changes to bid_amount, bid_strategy, or targeting can re-trigger Meta's learning phase.`,
+      description: `${WRITE_WARNING}Update an existing ad set in place. Common use cases: change daily_budget or lifetime_budget (unit: see daily_budget), pause/reactivate via status (ACTIVE/PAUSED), extend end_time, replace targeting, adjust bid_amount/bid_strategy, or rename. Only the fields you pass are sent to Meta — omitted fields keep their current value. lifetime_budget requires a corresponding end_time on the ad set. Authentication is handled transparently: the active Meta token is resolved from the request context (Sign in with Meta OAuth, registered System User token, or X-Meta-Token header in service-to-service mode). Note that meaningful changes to bid_amount, bid_strategy, or targeting can re-trigger Meta's learning phase.`,
       inputSchema: {
         ad_set_id: z.string().describe("Ad set ID to update"),
         name: z.string().optional().describe("New ad set name"),
         status: statusEnum.optional().describe("New status. Use ACTIVE to start delivery, PAUSED to stop, ARCHIVED to retire. Use ads_delete_ad_set for soft-deletion."),
         destination_type: destinationTypeEnum.optional().describe("Where the ad traffic is directed. Common values: WEBSITE (website traffic/conversions), APP (app installs), MESSENGER (Messenger conversations), WHATSAPP (WhatsApp conversations), INSTAGRAM_DIRECT (Instagram DMs), ON_AD (lead forms, instant experiences, post engagement), ON_VIDEO (video views), ON_PAGE (page engagement), SHOP_AUTOMATIC (shop)"),
-        daily_budget: z.number().optional().describe("Daily budget in cents (e.g., 2000 = $20.00). Mutually exclusive with lifetime_budget."),
-        lifetime_budget: z.number().optional().describe("Lifetime budget in cents. Requires the ad set to have an end_time set; pass end_time in the same call if it isn't already configured."),
+        daily_budget: z.number().optional().describe(`Daily budget ${MINOR_UNIT_NOTE}. Mutually exclusive with lifetime_budget.`),
+        lifetime_budget: z.number().optional().describe("Lifetime budget, in the same unit as daily_budget. Requires the ad set to have an end_time set; pass end_time in the same call if it isn't already configured."),
         targeting: targetingSchema.optional().describe("Replacement targeting spec. Replaces the entire targeting object — pass the full spec, not a partial one."),
-        bid_amount: z.number().optional().describe("Bid cap in cents. Only meaningful with bid_strategy = LOWEST_COST_WITH_BID_CAP or COST_CAP."),
+        bid_amount: z.number().optional().describe("Bid cap, in the same unit as daily_budget. Only meaningful with bid_strategy = LOWEST_COST_WITH_BID_CAP or COST_CAP."),
         bid_strategy: bidStrategyEnum.optional().describe("Bidding strategy. Changing strategy may require corresponding changes to bid_amount."),
         end_time: z.string().optional().describe("ISO 8601 end time. Required when setting or keeping lifetime_budget."),
       },
@@ -889,10 +922,11 @@ export function registerAdSetTools(server: McpServer): void {
       if (end_time !== undefined) body.end_time = end_time;
 
       await metaApiClient.postForm<{ success: boolean }>(`/${id}`, body);
+      const amountLines = await statedAmounts(body, { entityId: id });
 
       return {
         content: [
-          { type: "text", text: `Ad set ${id} updated successfully.\nChanges: ${JSON.stringify(body)}` },
+          { type: "text", text: `Ad set ${id} updated successfully.\nChanges: ${JSON.stringify(body)}${amountLines}` },
         ],
       };
     },

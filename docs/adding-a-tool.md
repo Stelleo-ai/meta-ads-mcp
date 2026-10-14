@@ -1,6 +1,6 @@
 # Adding a new MCP tool
 
-This is the canonical guide for extending meta-ads-mcp with a Meta Marketing API endpoint that isn't already covered by the 93 built-in tools. Follow it end-to-end and your tool will inherit every security, rate-limit, circuit-breaker, error-handling, multi-tenant, and MCP-annotation guarantee the rest of the server provides.
+This is the canonical guide for extending meta-ads-mcp with a Meta Marketing API endpoint that isn't already covered by the 142 built-in tools. Follow it end-to-end and your tool will inherit every security, rate-limit, circuit-breaker, error-handling, multi-tenant, and MCP-annotation guarantee the rest of the server provides.
 
 If you're contributing for the first time, also read [CONTRIBUTING.md](../CONTRIBUTING.md) for setup, CI checks, commit conventions, and the auth-surface review policy.
 
@@ -10,7 +10,7 @@ If you're contributing for the first time, also read [CONTRIBUTING.md](../CONTRI
 2. Add a `register*Tools(server)` function (or extend the existing one) that calls `server.registerTool(name, config, handler)`.
 3. Use the `ads_*` naming convention (no `meta_` prefix) and aligned vocabulary (`ad_set` not `adset`).
 4. Spread the appropriate annotation constant from [src/tools/_register.ts](../src/tools/_register.ts) into `annotations`. Prefix write-tool descriptions with `WRITE_WARNING`.
-5. In the handler, call **`metaApiClient.get / post / postForm / postMultipart / delete / getPaginated`** — never `fetch` directly.
+5. In the handler, call **`metaApiClient.get / post / postForm / postMultipart / delete / getPaginated`** — never `fetch` directly. (One exception exists: the `ads_library_*` tools talk to Apify, not the Graph API, and route through `apifyApiClient` in [src/apify/client.ts](../src/apify/client.ts), which provides the same timeout / retry / typed-`McpError` guarantees. Any *new* non-Meta upstream needs its own such client — never a bare `fetch` in a handler.)
 6. Validate IDs with `normalizeAccountId` / `validateMetaId` from [src/utils/format.ts](../src/utils/format.ts).
 7. Reuse type definitions from [src/meta/types/](../src/meta/types/), register the new module in [src/tools/index.ts](../src/tools/index.ts), and bump the tool count assertion in [tests/tools/registration.test.ts](../tests/tools/registration.test.ts).
 8. Mirror the source path under `tests/tools/` with a vitest, run `npm run lint && npm run typecheck && npm test && npm run build`, and open a PR using [.github/PULL_REQUEST_TEMPLATE.md](../.github/PULL_REQUEST_TEMPLATE.md).
@@ -29,7 +29,7 @@ metaApiClient.{get|post|postForm|delete|...}  ◄── shared singleton
    ├── circuit-breaker  (assertClosed before any call)
    ├── write-pacer      (acquire token for POST/DELETE on account paths)
    ├── rate-limiter     (waitIfNeeded based on last X-App-Usage / X-BUC-Usage)
-   ├── fetch (Graph API v25.0)
+   ├── fetch (Graph API v26.0)
    ├── header parser    (updateFromHeaders → updates rate-limiter + pacer tier)
    ├── error classifier (classifyMetaError → McpError + retry/throttle policy)
    └── retry w/ exp. backoff + jitter (only on transient + 5xx)
@@ -88,6 +88,7 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { metaApiClient } from "../meta/client.js";
 import { validateMetaId } from "../utils/format.js";
+import { MINOR_UNIT_NOTE } from "../meta/currency.js";
 import { CREATE, WRITE_WARNING } from "./_register.js";
 
 export function registerBudgetTools(server: McpServer): void {
@@ -97,8 +98,8 @@ export function registerBudgetTools(server: McpServer): void {
       description: `${WRITE_WARNING}Schedule a temporary budget increase for a campaign during high-demand periods (e.g., Black Friday, product launches).`,
       inputSchema: {
         campaign_id: z.string().describe("Campaign ID"),
-        budget_value: z.string().describe("Budget amount in cents (for ABSOLUTE) or multiplier value (for MULTIPLIER)"),
-        budget_value_type: z.enum(["ABSOLUTE", "MULTIPLIER"]).describe("ABSOLUTE = set exact budget in cents, MULTIPLIER = multiply current budget"),
+        budget_value: z.string().describe(`For ABSOLUTE, a budget amount ${MINOR_UNIT_NOTE}. For MULTIPLIER, the multiplier value.`),
+        budget_value_type: z.enum(["ABSOLUTE", "MULTIPLIER"]).describe("ABSOLUTE = set exact budget (unit: see budget_value), MULTIPLIER = multiply current budget"),
         time_start: z.string().describe("ISO 8601 start time for the budget increase"),
         time_end: z.string().describe("ISO 8601 end time for the budget increase"),
       },
@@ -127,7 +128,7 @@ What each part does:
 - **`annotations: { ...CREATE }`** — spread of the standard ToolAnnotations for create operations. Clients render confirmation prompts based on these.
 - **`${WRITE_WARNING}` prefix** — for write tools only. Clients that don't read annotations still see the warning.
 - **`validateMetaId(campaign_id, "campaign")`** — defence-in-depth on top of `z.string()`. The helper enforces `^(act_\d+|\d+|\d+_\d+)$` and throws otherwise, so a malformed id can't add path segments / query strings to the URL. Every tool that interpolates a non-account id (campaign / ad set / ad / creative / page / business…) into a Graph path must call this at the start of the handler.
-- **`metaApiClient.postForm(...)`** — issues `POST /v25.0/<id>/budget_schedules` with `application/x-www-form-urlencoded` body. Behind the scenes the client looks up the per-request access token, checks the circuit-breaker, throttles writes, retries transient failures, and converts any Meta error into a typed `McpError`.
+- **`metaApiClient.postForm(...)`** — issues `POST /v26.0/<id>/budget_schedules` with `application/x-www-form-urlencoded` body. Behind the scenes the client looks up the per-request access token, checks the circuit-breaker, throttles writes, retries transient failures, and converts any Meta error into a typed `McpError`.
 - **Return shape** — every handler must return `{ content: [{ type: "text", text: "..." }, ...] }`. Adding a second `text` block with the raw JSON (`JSON.stringify(obj, null, 2)`) is a common pattern for read tools — see [src/tools/campaigns.ts](../src/tools/campaigns.ts).
 
 ## Templates
@@ -212,7 +213,7 @@ server.registerTool(
 
 ### Update / delete on a non-account resource
 
-When the path is `/<resource_id>/...` (campaign, ad set, ad, creative, page, business, etc.) instead of `/act_<account>/...`, validate the id with `validateMetaId` before interpolation. Without it, the `z.string()` schema accepts payloads like `"123/insights"` and `metaApiClient` will dutifully send a `POST` to `/v25.0/123/insights/...`, hitting an unintended endpoint with the caller's token.
+When the path is `/<resource_id>/...` (campaign, ad set, ad, creative, page, business, etc.) instead of `/act_<account>/...`, validate the id with `validateMetaId` before interpolation. Without it, the `z.string()` schema accepts payloads like `"123/insights"` and `metaApiClient` will dutifully send a `POST` to `/v26.0/123/insights/...`, hitting an unintended endpoint with the caller's token.
 
 ```ts
 import { validateMetaId } from "../utils/format.js";
@@ -346,7 +347,7 @@ describe("registerMyResourceTools", () => {
 });
 ```
 
-**Important:** [tests/tools/registration.test.ts](../tests/tools/registration.test.ts) hard-codes the total tool count (`expect(server.registerTool).toHaveBeenCalledTimes(93)` at the time of writing). When you add a tool, bump that number, add an `expect(names).toContain("ads_my_new_tool")` assertion, and update the count comment in [src/tools/index.ts](../src/tools/index.ts).
+**Important:** [tests/tools/registration.test.ts](../tests/tools/registration.test.ts) hard-codes the total tool count (`expect(server.registerTool).toHaveBeenCalledTimes(142)` at the time of writing). When you add a tool, bump that number, add an `expect(names).toContain("ads_my_new_tool")` assertion, and update the count comment in [src/tools/index.ts](../src/tools/index.ts).
 
 ## Verification
 
@@ -377,10 +378,11 @@ The full checklist lives in [.github/PULL_REQUEST_TEMPLATE.md](../.github/PULL_R
 
 - [ ] New file under `src/tools/` plus mirror test under `tests/tools/`.
 - [ ] Registered in [src/tools/index.ts](../src/tools/index.ts) with a `registerXxxTools(server)` call **and** total tool count bumped in [tests/tools/registration.test.ts](../tests/tools/registration.test.ts).
+- [ ] Listed in [skills/meta-ads-mcp-guide/references/tool-map.md](../skills/meta-ads-mcp-guide/references/tool-map.md) under the intent it serves, with a ⚠️ mark if and only if it is a write tool, and the "N in total; M are read-only" line updated. [tests/skills/tool-map.test.ts](../tests/skills/tool-map.test.ts) fails when a registered tool is missing from the map, when the map names a tool that does not exist, or when a ⚠️ mark disagrees with the tool's annotations.
 - [ ] Tool name uses `ads_*` prefix, with `ad_set` (not `adset`) where applicable.
 - [ ] `annotations` declared with the right constant from [src/tools/_register.ts](../src/tools/_register.ts); write-tool descriptions prefixed with `WRITE_WARNING`.
 - [ ] Zod schema with `.describe()` on every field; narrow enums where possible.
-- [ ] All Graph API calls go through `metaApiClient` — no direct `fetch`.
+- [ ] All Graph API calls go through `metaApiClient` — no direct `fetch`. (Apify calls go through `apifyApiClient` in [src/apify/client.ts](../src/apify/client.ts); Gemini calls go through the client in [src/gemini/client.ts](../src/gemini/client.ts); video and image downloads go through [src/media/](../src/media/); any other upstream needs its own client with the same DNS pinning and host allowlist.)
 - [ ] IDs validated with `normalizeAccountId` / `validateMetaId`.
 - [ ] If the endpoint hits `/insights`, `enforceInsightsGuardrails(...)` is called.
 - [ ] No raw token in logs (`hashToken` / `maskToken`).

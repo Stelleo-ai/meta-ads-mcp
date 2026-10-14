@@ -1,4 +1,4 @@
-FROM node:22-alpine AS builder
+FROM node:22-alpine3.24 AS builder
 WORKDIR /app
 
 COPY package.json package-lock.json ./
@@ -8,14 +8,19 @@ COPY tsconfig.json ./
 COPY src/ src/
 RUN npm run build
 
-FROM node:22-alpine AS runtime
+FROM node:22-alpine3.24 AS runtime
 WORKDIR /app
 
 ENV NODE_ENV=production
 
+# ffmpeg + ffprobe for keyframe extraction / compact video transcodes (ads_get_video_media).
+RUN apk add --no-cache ffmpeg
+
 COPY --from=builder /app/dist/ dist/
 COPY --from=builder /app/node_modules/ node_modules/
 COPY package.json ./
+# The skills ship with the server: they are published as MCP resources at runtime.
+COPY skills/ skills/
 
 EXPOSE 3000
 

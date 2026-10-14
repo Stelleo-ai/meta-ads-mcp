@@ -38,9 +38,45 @@ export const ctaEnum = z.enum([
   "LIKE_PAGE", "FOLLOW_PAGE", "EVENT_RSVP", "DONATE_NOW",
   // Local
   "GET_DIRECTIONS",
-  // AI features (v25.0)
+  // AI features (v25.0+)
   "SHOP_WITH_AI", "TRY_ON_WITH_AI",
 ]);
+
+const AD_IMAGE_EXTENSIONS = [".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tiff"];
+const AD_IMAGE_FILE_NAME_MAX = 100;
+
+/** Meta names an ad image after the multipart file name, not after the `name` field. */
+export function adImageFileName(name: string | undefined, extension: string): string {
+  const fallback = `image${extension}`;
+  if (!name) return fallback;
+
+  let base = name
+    .split(/[/\\]/)
+    .pop()!
+    .replace(/\s+/g, " ")
+    .replace(/[\u0000-\u001f\u007f-\u009f"<>:|?*]/g, "")
+    .replace(/\s+/g, " ")
+    .replace(/^[.\s]+/, "")
+    .trim();
+  if (!base) return fallback;
+
+  const same = (a: string, b: string) => {
+    const norm = (e: string) => (e === ".jpeg" ? ".jpg" : e);
+    return norm(a.toLowerCase()) === norm(b.toLowerCase());
+  };
+  const dot = base.lastIndexOf(".");
+  const current = dot > 0 ? base.slice(dot) : "";
+  let ext = extension;
+  if (current && same(current, extension)) {
+    ext = current;
+    base = base.slice(0, dot);
+  } else if (current && AD_IMAGE_EXTENSIONS.includes(current.toLowerCase())) {
+    base = base.slice(0, dot);
+  }
+
+  base = Array.from(base).slice(0, Math.max(0, AD_IMAGE_FILE_NAME_MAX - ext.length)).join("").trimEnd();
+  return base ? `${base}${ext}` : fallback;
+}
 
 export function asRecord(value: unknown): Record<string, unknown> | undefined {
   return typeof value === "object" && value !== null ? value as Record<string, unknown> : undefined;
@@ -123,7 +159,7 @@ function buildCreativeFieldsParam(fields?: string[]): string {
   return buildFieldsParam(expanded, [...CREATIVE_DEFAULT_FIELDS]);
 }
 
-function withDerivedEffectiveLinkUrl(creative: AdCreative): AdCreative {
+export function withDerivedEffectiveLinkUrl(creative: AdCreative): AdCreative {
   const effectiveLinkUrl = extractEffectiveLinkUrl(creative);
   return effectiveLinkUrl && !creative.effective_link_url
     ? { ...creative, effective_link_url: effectiveLinkUrl }
@@ -428,7 +464,7 @@ export function registerCreativeTools(server: McpServer): void {
         formData.set(
           "filename",
           new Blob([imageBytes], { type: downloaded.contentType }),
-          `image${downloaded.extension}`,
+          adImageFileName(name, downloaded.extension),
         );
         if (name) formData.set("name", name);
 

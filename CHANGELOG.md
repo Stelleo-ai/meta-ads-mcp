@@ -7,6 +7,786 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Fixed
+
+- **`ads_upload_ad_image` names the image after the `name` argument.** Meta
+  names an ad image after the multipart file name and ignores the separate
+  `name` field, and the tool always sent `image<ext>`, so every image
+  uploaded through it was called `image.png` in the library (measured
+  against a test ad account: `name: "o2-handoff-live-check.png"` came back as
+  `image.png`). The file name is now built from `name`: last path segment
+  only, control characters (C0, DEL and C1) and `" < > : | ? *` removed,
+  whitespace collapsed, leading dots dropped, the extension the download
+  reported (derived from its content type; a different image extension in
+  the name is replaced, not stacked), at most 100 characters, counted by
+  code points so a character is never split. Without `name` it stays
+  `image<ext>`. The `name` field is still sent.
+- **Budgets and bids are no longer described as "cents" for every
+  currency.** The tool descriptions said `5000` is `$50.00` whatever the
+  account, which is true only where Meta's currency offset is 100. For the
+  eleven currencies Meta counts in whole units (COP, CLP, CRC, HUF, ISK, IDR,
+  JPY, KRW, PYG, TWD, VND) an agent that followed the description sent a
+  budget 100 times too large. The descriptions of `ads_create_campaign`,
+  `ads_update_campaign`, `ads_create_ad_set`, `ads_update_ad_set`,
+  `ads_clone_ad_set_bundle`, `ads_create_budget_schedule` and
+  `ads_update_entity` now say the amount is in the account currency's minor
+  unit as Meta defines it, with one example of each kind, and tell the model
+  to read the account currency first. This matches what the server's own
+  guide already said. The offsets come from
+  [Meta's currency table](https://developers.facebook.com/docs/marketing-api/currencies),
+  kept in `src/meta/currency.ts`; a test fails if a description says "cents"
+  again without naming the currencies that have none. What is sent to Meta
+  does not change.
+- **Creating or updating a campaign or an ad set states the amount in the
+  account's currency.** The result gains one line per amount sent, such as
+  `Daily budget: COP 50,000 (account currency COP)` or
+  `Daily budget: USD 50.00 (account currency USD)`, so a wrong unit shows in
+  the answer to the call that set it. The lines are built from the body
+  that went to Meta, not from the tool's arguments, so an argument the
+  handler dropped is never confirmed. The currency is read after the write
+  succeeds, with one `GET` per token and account that is then answered from
+  memory; an update reads the object's account first. That read only words
+  the result, so it is kept apart from everything the client shares between
+  requests: nothing it receives reaches the rate limiter, the write pacer
+  or the circuit breaker, it is never retried, it is cancelled (body
+  included) at two seconds, and at most eight run at once. It makes no
+  request while the account's circuit is open or the rate limiter would
+  wait. The token is fixed when the lookup starts: both of its requests and
+  the entry it remembers belong to that one, even if the process-wide active
+  token changes meanwhile (API-key and stdio mode). Without a currency the
+  line gives the raw amount and says it is in the account currency's minor
+  unit. `ads_clone_ad_set_bundle` restates only a budget passed in
+  `target_ad_set` that was actually sent, not one copied from the source.
+- **Amounts read from Meta are shown by Meta's offset, not divided by 100
+  or by ISO 4217 decimals.** `ads_get_billing_info` and `ads_get_spend_limit`
+  divided every amount by 100, so a COP account's 5,000,000 spent read
+  `50000.00 COP`; they now show `COP 5,000,000`, and `USD 500.00` for 50000
+  in a USD account. `ads_get_ad_dossier` took the decimals from `Intl`, which
+  follows ISO 4217: budgets in COP, CRC, HUF, IDR and TWD came out 100 times
+  too small and those in BHD and JOD divided by 1,000. All three use the
+  table in `src/meta/currency.ts`. Without a currency, or with one that is
+  not in the table, the raw number is shown with its unit named
+  (`50000 (in the account currency's minor unit)`); the billing tools no
+  longer assume USD. Insights figures (`spend`, `cpc`, `cpm`), which Meta
+  returns in whole currency, are not touched. `Min Daily Budget` in
+  `ads_get_spend_limit` still divides by 100: Meta's reference does not
+  state its unit.
+- **`ads_update_spend_cap` said the cap was in cents; it is in whole
+  currency.** Checked against a live USD account: `1000000` sent reads back
+  as `"100000000"`, a cap of USD 1,000,000, so an agent that followed the
+  description set a cap 100 times the one it meant, in every currency with
+  hundredths. The description and the parameter now say the cap is written
+  in the account currency's standard unit (`500` = USD 500.00, `50000` =
+  COP 50,000), that this is not the minor unit used for `daily_budget`, and
+  that setting a cap restarts the account's amount-spent counter. The value
+  sent is still exactly the one passed.
+- **`ads_update_spend_cap` with `0` now removes the cap.** It sent
+  `spend_cap=0`, which Meta ignores, and answered "No limit (removed)" while
+  the cap stayed. It sends `spend_cap_action=delete`, Meta's documented way.
+- **`ads_update_spend_cap` reports what Meta holds after the write.** Its
+  result divided the value by 100 and labelled it USD for every account. It
+  now reads `spend_cap`, `amount_spent` and `currency` back and prints them,
+  for example `Spend cap now: USD 1,000,000.00 (read back from Meta)`, or
+  `none` after a removal. If that read fails, the result says the write
+  succeeded and that the value could not be confirmed.
+- **`ads_get_spend_limit` works again.** It requested `daily_spend_limit`,
+  which is not a field of an ad account, and Meta rejected the whole call
+  with `(#100) Tried accessing nonexisting field`. The field and its line
+  are gone; every field it requests is in Meta's AdAccount reference.
+- **An account without a spend cap reads as "no limit", and only then.**
+  Meta sends `spend_cap: "0"` for an account that has no cap (its AdAccount
+  reference: "A value of 0 means no spending-cap"; read back the same way
+  from a live account). Four places read that field, each in its own way.
+  `ads_get_spend_limit` printed `Spend Cap: USD 0.00` and a negative
+  `Remaining`, `ads_get_billing_info` printed `USD 0.00`, and
+  `ads_get_account_info` printed `0`. They now print `No limit set`,
+  `No limit` and `None`, and `ads_get_spend_limit` prints no `Remaining` or
+  `Usage` line without a cap. The opposite mistake is gone too: a `spend_cap`
+  that Meta left out or sent as `null` was read as "no limit" by those three,
+  and the read-back of `ads_update_spend_cap` reported an empty string as
+  `none`. A field that is missing, `null`, empty or anything else that is not
+  a non-negative number (text or a negative number used to print as `n/a`, as
+  an amount or as sent) now reads `not reported by Meta`, and `not confirmed`
+  after a write. One function, `readSpendCap` in `src/meta/spend-cap.ts`,
+  decides it for all four. A cap that is a whole number, which is what Meta
+  sends, prints as before; `ads_get_spend_limit` cut the decimals off any
+  other and now shows the value as it arrived. Nothing sent to Meta changes.
+- **`ads_get_ad_accounts` no longer prints a status or a currency it was not
+  given.** With a custom `fields` list that left out `account_status` or
+  `currency`, every account read `Status: DISABLED` and
+  `Currency: undefined`. A field that was not requested is not printed, and
+  an account without `name` or `account_id` is listed by its `id`.
+- **ffmpeg's encoders are limited to one thread.** The wrapper passed
+  `-threads 1` before `-i`, which bounds decoding, and `-filter_threads 1`,
+  which bounds filtering; the encoders were unbounded, so libx264 sized its
+  own pool to the machine and one `delivery=inline` transcode could occupy
+  every core the instance had. An output-side `-threads 1` now bounds the
+  H.264 encoder in `compact()` and the MJPEG encoder in `extractFrames()`
+  and `contactSheet()`. Measured with ffmpeg 9.0.1 on a 20-second 1080p
+  clip, peak threads for the transcode drop from 28 to 9, the remaining
+  ones being ffmpeg's own scheduler threads. On a 240-second 1080p clip, the
+  longest the server accepts, the transcode's wall time is unchanged at
+  11 seconds, because decoding the 1080p source, not encoding at 480p, is
+  the bottleneck; it used 26 seconds of CPU, far inside the 150-second
+  timeout even on a slower core. SECURITY.md now describes each limit as
+  implemented.
+- **`ads_get_video_media`'s description states both inline caps.** It gave
+  only the HTTP cap and said Claude Code and Claude Desktop reject large
+  results, which confused the transport with the client: the 6 MiB of raw
+  media is this server's budget for stdio, sized to the TypeScript MCP SDK
+  clients' default 10 MiB read buffer, and the advice to use frames is a
+  property of models
+  that read images rather than video. Agents read this text on every
+  `tools/list`, and Context7 quotes it.
+
+## [4.0.0] — 2026-09-18
+
+### Why this release
+
+Two things that installers and clients depend on changed since 3.6.0, and
+either alone makes this a major. The minimum Node.js is now 22.13: Node 20
+left support in April 2026, the production image had run Node 22 since the
+video pipeline landed while CI still tested on 20, and the two dependency
+majors that were waiting on the floor (`@google-cloud/firestore` 9 and
+vitest 5) are in this release. And the JSON Schemas the server publishes for its 142
+tools are now produced by zod 4's converter, which emits different output
+from the one zod 3 used; the differences are listed under Changed and in
+[docs/migration-v4.md](docs/migration-v4.md).
+
+The release also carries everything the four creative-analysis PRs built:
+a hardened video pipeline that hands a model real keyframes or the MP4
+itself, Ad Library media, server-side video analysis with Gemini on the
+tenant's own key, a one-call ad dossier, and four skills published as MCP
+resources, prompts and server instructions. Plus the deploy fixes that
+followed them: the Cloud Run execution environment pinned to gen2, results
+over stdio budgeted to the SDK's read buffer, and an ffmpeg startup probe
+that no longer caches a timeout as "no ffmpeg".
+
+What does not change: every tool name, every existing parameter and its
+meaning (several tools gained optional parameters), the authentication
+model, both transports, and the `register*Tools(server)` exports.
+
+### Breaking changes
+
+- **Minimum Node.js is 22.13.** `engines.node` moved from `>=20.10.0` to
+  `>=22.13.0`, which npm treats as a warning by default and as an install
+  failure under `engine-strict`, so it is a major for anyone installing the
+  package. The production image had run Node 22 since the video pipeline
+  landed while the workflows tested on Node 20, and Node 20 left support in
+  April 2026. 22.13 rather than 22 flat because the toolchain needs it:
+  ESLint 10 requires `^22.13.0` on the 22 line; vitest 5 (#154), in this
+  release, requires `^22.12.0 || ^24.0.0 || >=26.0.0`; and
+  `@google-cloud/firestore` 9 (#149), also in this release, requires Node 22
+  as its only breaking change. CI, the deploy preflight and the publish
+  workflow run Node 22, and the Dependabot config no longer holds vitest
+  back at 4.
+- **The published tool JSON Schemas changed.** zod 4's converter drops
+  `additionalProperties: false` from every object, inlines reused
+  sub-schemas and adds a few informative keywords. No tool's accepted input
+  changed; the details and the consequence for OpenAI strict function calling
+  are under Changed and in [docs/migration-v4.md](docs/migration-v4.md).
+- **Tool results over stdio are budgeted to 6 MiB of media.** The unreleased
+  first version of `ads_get_video_media` advertised inline video up to
+  50 MiB over stdio, which no client using the SDK's default 10 MiB read
+  buffer can receive; the budget is now sized to that buffer. HTTP is
+  unchanged. Details
+  under Fixed.
+
+### Added
+
+- **One ad in full — `ads_get_ad_dossier` (141 → 142 tools).** A creative
+  review needs the ad, its ad set and campaign, the creative with its copy,
+  effective landing URL and UTM tags, the targeting in Meta's own words, the
+  performance for the period with the video retention funnel and the auction
+  rankings, and the creative media itself. Asking for each separately costs a
+  dozen calls. Only the first call, for the ad, can fail the tool; every other
+  section is fetched in parallel and a section that fails is named in
+  `sections_failed` rather than losing the rest. The retention funnel is
+  reported as shares of plays, guarded against zero plays, and a below-average
+  ranking carries Meta's own hypothesis about what to change.
+- **Four skills, shipped with the server and exposed over MCP.**
+  `meta-ads-mcp-guide` (which tool answers which question, what writes cost,
+  the ID and permission rules that make calls fail, plus a map of all 142
+  tools, the recurring workflows and a safety-and-costs reference),
+  `meta-ads-creative-analysis`, `meta-ads-video-analysis` and
+  `meta-ads-competitor-research`. They are published as MCP **resources** under
+  `meta-ads://skills/`, wrapped in six MCP **prompts** that start a job with
+  the relevant skill already in hand (`analyze_ad`, `analyze_ad_video`,
+  `competitor_creative_research`, `ad_library_ad_deep_dive`,
+  `creative_performance_review`, `account_health_check`), and summarized in the
+  server's `instructions`, which a client receives before its first tool call.
+  The directories can also be installed locally with
+  `cp -r skills/* ~/.claude/skills/`.
+- **Server-side video analysis with Gemini — `ads_analyze_video` plus per-tenant
+  key management (137 → 141 tools).** For agents whose own model cannot ingest
+  video at all: the server downloads the video through the existing hardened
+  pipeline, sends it to Google Gemini with the user's own API key, and returns a
+  structured analysis (hook with a 1-5 score and its reasoning, verbatim
+  transcript, on-screen text, scene list, audio, format, branding, claims a
+  reviewer might question, strengths, weaknesses, ideas to test, and a direct
+  answer to an optional `focus` question). Own-account videos and Ad Library
+  videos both work, one per call, with `card_index` to pick one from a carousel
+  or DCO ad. The tool description points a video-capable client at
+  `ads_get_video_media delivery=inline` first, since that is free, and states
+  the cost (about USD 0.02 per ad against the user's own quota) and that the
+  video is sent to Google. `ads_register_gemini_key`,
+  `ads_get_gemini_key_status` and `ads_delete_gemini_key` mirror the Apify token
+  tools, and the key can also be registered from `/auth/connections`.
+  Small videos are embedded in the request and stored nowhere; larger ones go
+  through the Files API and are deleted as soon as the analysis returns.
+  Request and response shapes were verified against the wire types of the
+  official `googleapis/js-genai` SDK.
+- **Ad Library ads with their media — `ads_library_get_ad_details` (136 → 137 tools).**
+  The compact projection of `ads_library_get_results` gains a `media` summary
+  (display format, image and video counts, `has_video`, the CDN expiry decoded
+  from the signed URLs) and the absolute `offset` of every item; the error
+  records the actor pushes (`ADS_NOT_FOUND`) come back as `{ offset, error }`
+  instead of empty rows. The new tool locates one ad in a dataset (by
+  `hint_offset`, or an id-only scan cached per dataset — reading a dataset is
+  free on Apify), normalizes the actor record (page, dates, platforms, copy per
+  card with DCO/DPA template detection, images, videos, transparency blocks),
+  attaches the images as inline blocks behind the Meta CDN host allowlist, and
+  delivers the videos through the same pipeline as own-account media
+  (`thumbnail` / `frames` / `url`) under the shared response budget.
+  `ads_get_video_media` now resolves `dataset_id` + `ad_archive_id` as well, so
+  a scraped video can be embedded inline for a video-capable model. Schema and
+  fixtures come from real actor output (build 2.7.x): snake_case records,
+  `video_hd_url` occasionally null with `video_sd_url` always present, and
+  `{{product.*}}` placeholders at ad level for DCO/DPA.
+- **Video analysis — `ads_get_video_media` (135 → 136 tools).** Any MCP agent
+  can now analyze an ad video, not just its poster frame. The tool resolves a
+  `video_id`, an `ad_id` or a `creative_id` (every video in the creative,
+  capped by `max_videos`), downloads the file from Meta's CDN behind the
+  existing SSRF guard plus a host allowlist, validates it with `ffprobe`
+  before any decode, and delivers it in the mode the calling model can
+  consume: `frames` (real keyframes as image blocks — a contact sheet by
+  default, individual frames or an `audio/aac` track on request), `inline`
+  (the MP4 embedded as an MCP `resource` blob for video-capable clients such
+  as Gemini, transcoded to a compact rendition that fits `max_inline_bytes`),
+  `url` (signed CDN links as `resource_link` blocks with their expiry) or
+  `thumbnail`. Progress notifications are sent when the client supplies a
+  `progressToken`; JSON metadata carries duration, dimensions, fps, audio
+  presence, block indexes and the CDN expiry decoded from the `oe` parameter.
+- **`ads_get_creative_media` gains `video_delivery`** (`thumbnail` by default,
+  unchanged; `frames` appends keyframes; `url` appends signed links), and
+  `ads_get_video_details` / `ads_get_ad_videos` now request `permalink_url`.
+- **`/health` reports `ffmpeg: true|false`** once a probe has been
+  conclusive, and omits the key until one has.
+- `is_adset_budget_sharing_enabled` on `ads_update_campaign`. Meta documents
+  turning budget sharing off on an existing campaign; turning it on for a
+  running campaign is rejected (error 3858418).
+- `FINANCIAL_PRODUCTS_SERVICES` and `ONLINE_GAMBLING_AND_GAMING` in
+  `ads_create_campaign`'s `special_ad_categories`, matching Meta's current
+  campaign reference.
+- **A warning log when Meta auto-upgrades a call** (`X-Ad-Api-Version-Warning`),
+  at most once an hour, as `meta_api_version_auto_upgraded`. Meta only sends
+  the header once the requested version has been retired, so it is a reactive
+  signal that the pin is overdue: by then, endpoints changed since that version
+  already fail, and the auto-upgrade itself can be disabled in the app's
+  Marketing API settings. The retirement dates in Meta's changelog index are
+  the way to stay ahead of it. The log line carries the configured version and
+  Meta's header text only.
+
+### Changed
+
+- **zod 3 → 4.** Eight `z.record` calls gain the key schema zod 4 requires,
+  and one test that read zod 3's private internals to find an enum now reads
+  the JSON Schema a client sees. Nothing else in the code changed and the
+  full suite passes. Three runtime differences come with zod 4 itself, all
+  tightenings: `.int()` rejects integers beyond ±2^53−1, which no Meta id or
+  offset reaches; `z.number()` rejects ±Infinity, which JSON only produces
+  from an overflowing literal such as `1e400`; and `.url()` strips
+  surrounding whitespace and embedded tab, CR and LF, so a WhatsApp website
+  or endpoint is sent trimmed. What clients see also changes, because the MCP SDK
+  converts tool schemas with zod's own converter on zod 4 instead of
+  `zod-to-json-schema`, and the two differ. Compared field by field across
+  all 142 tools: `additionalProperties: false` disappears from 138 top-level
+  schemas and 43 nested objects (four tools have no properties and never had
+  it), which was a promise the runtime never kept, since `z.object` strips
+  unknown keys rather than rejecting them in both majors. MCP allows the
+  keyword to be omitted. The one place it mattered is OpenAI's strict
+  function calling, which requires it on every object alongside every field
+  being required; 102 tools have optional fields and never qualified, 4 take
+  no parameters and never carried the keyword, and the 36 with every
+  top-level field required did carry it and no longer do, an accepted
+  change; 23
+  `$ref`s to reused sub-schemas are inlined, which
+  clients that do not resolve references can now read; the 12 free-form
+  records gain `propertyNames: {type: string}`; integer fields gain
+  safe-integer bounds; the email field gains a `pattern` next to its
+  `format`; and `.passthrough()` objects say `additionalProperties: {}`
+  rather than `true`, which mean the same. Serialized compactly, the
+  `tools/list` payload shrinks by 1%.
+- The server's version now comes from `package.json` rather than a constant
+  that had already drifted (it reported 3.0.0 while the package was at 3.6.0).
+- The image download loop moved out of `ads_get_creative_media` into
+  `src/media/creative-images.ts`, and the auction-ranking reading into
+  `src/tools/rankings.ts`, so the dossier and the existing tools share one
+  implementation. `withDerivedEffectiveLinkUrl` is exported, and
+  `VIDEO_INSIGHTS_FIELDS` and `RANKING_INSIGHTS_FIELDS` join the insights
+  types.
+- `skills/` is part of the published package and of the runtime image, with an
+  explicit `.dockerignore` negation so the blanket `*.md` rule cannot swallow
+  it. Verified by building the image and loading the skills from `dist/` inside
+  it.
+
+
+- `/auth/connections` and the OAuth consent page gained a Gemini section next to
+  the Apify one, with the same rules: a password field, no disconnect button
+  mid-OAuth, and a status read that degrades to "not connected" rather than
+  taking down OAuth approval. `POST /auth/register-gemini-key` is rate-limited
+  like its Apify counterpart, since each call reaches out to Google.
+- The budgeted response-body reader moved out of the Apify client into
+  `src/utils/bounded-body.ts`, and the single-line sanitizer for untrusted text
+  out of the Ad Library renderer into `src/utils/single-line.ts`, so both
+  outbound clients and both renderers share one implementation.
+- **Runtime image and Cloud Run sizing.** The Docker image is pinned to
+  `node:22-alpine3.24` and installs `ffmpeg`; the deploy runs with 2 GiB /
+  2 vCPU, concurrency 40 and a size-limited in-memory `/tmp` volume. CI and
+  the deploy preflight install `ffmpeg` so the keyframe integration tests run
+  for real (`FFMPEG_REQUIRED=1`).
+- **Tenant resolution shared.** The fail-closed rule that picked the Apify
+  token bucket now lives in `src/auth/tenant.ts` and also scopes the video
+  rate limiter; behaviour for `ads_library_*` is unchanged.
+- **Shared HTTP download plumbing.** DNS pinning, redirect re-validation and
+  header parsing moved from `safe-download.ts` into `src/utils/safe-http.ts`
+  so the image and video downloaders enforce the same policy.
+- **Every Meta call now targets Graph API / Marketing API v26.0.** The version
+  was set in six places that had drifted apart: `MetaApiClient` defaulted to
+  v25.0, the OAuth flow to v22.0, and the deploy workflow, `docker-compose.yml`,
+  the README and `.env.example` all pinned `META_API_VERSION=v22.0`. The env var
+  wins over the code default, so **the Cloud Run service was configured to
+  request v22.0** while a local `npm run dev` without the variable used v25.0.
+  - The Marketing API follows its own, shorter schedule: only v24.0 (until
+    October 6, 2026), v25.0 and v26.0 are still available. Meta answers a call
+    on a retired version by upgrading it when the endpoint has not changed
+    since, and by rejecting it when it has. Endpoints changed in v23.0 and
+    v24.0 include reading and creating campaigns, creating and updating ad
+    sets, creating creatives, delivery estimates, targeting search and custom
+    audiences.
+  - The version now lives only in `src/meta/api-version.ts`, and both the
+    client and the OAuth flow read it. `META_API_VERSION` still overrides it.
+    A blank value falls back to the default, and a value that is not of the
+    form `v26.0` stops the server at startup instead of being spliced into
+    request URLs.
+  - The pins stay explicit and move to v26.0. The deploy action merges env
+    vars into the Cloud Run service, so dropping the pin would have silently
+    kept v22.0. `tests/meta/api-version.test.ts` fails if any pin drifts from
+    the code default again.
+- **`ads_create_campaign` sends `is_adset_budget_sharing_enabled` for
+  ad-set-budget campaigns.** Since v24.0 Meta rejects a campaign without a
+  campaign budget unless the flag is explicit (error 4834011). The tool sends
+  `false` unless the caller passes `true`, which keeps each ad set spending
+  its own budget, and says in its response which setting was applied.
+  Campaigns with their own `daily_budget` or `lifetime_budget` are unchanged,
+  and asking for budget sharing on one is refused before calling Meta, which
+  would reject it (error 4834002).
+- **`ads_clone_ad_set_bundle` adapts the copied targeting to the API version
+  in use.** Ad sets created on older versions can carry placements Meta has
+  removed and no Advantage+ audience flag, so copying them verbatim fails.
+  - Facebook `video_feeds` (removed in v24.0), Instagram `explore` (v26.0) and
+    Messenger `story` (v26.0) are dropped from the copy when the client calls
+    a version that no longer has them. When one was the only position of a
+    selected platform, the positions field and the platform are removed as
+    Meta recommends. The clone is refused before anything is created when the
+    source does not set `publisher_platforms`, since dropping the field would
+    open every position of that platform, or when no placement is left.
+  - A missing `targeting_automation.advantage_audience` becomes an explicit
+    `0` on v23.0 and later, where Meta requires the flag for new ad sets with
+    non-default targeting. The source's effective setting cannot be inferred
+    once the relaxation fields are stripped, so the copy takes the choice that
+    never spends beyond the copied targeting.
+  - Each adjustment is reported in `warnings`, on dry runs as well.
+- **Rebuilt creatives keep their destination setting and WhatsApp identity.**
+  Since v26.0 a new creative without `destination_spec` defaults to Website
+  and Shop for advertisers with a shop, and a creative meant for WhatsApp
+  Status gets no WhatsApp identity unless the caller sends
+  `wamo_whatsapp_identity_spec`. `ads_update_ad_url_tags` and the creative
+  swap in `ads_clone_ad_set_bundle` now read both fields from the source
+  creative and send them with the replacement when Meta reports them, so an
+  explicit Website and Shop opt-out or a WhatsApp Status identity survives a
+  UTM or copy change. When Meta reports no setting, the replacement sends none
+  and follows Meta's default for eligible creatives.
+- **Ad set tool schemas describe the v24.0–v26.0 placement and audience rules.**
+  `video_feeds`, `explore` and Messenger `story` are no longer offered, and
+  `targeting_automation.advantage_audience` explains when Meta requires an
+  explicit value, including the v26.0 extension to Housing, Employment and
+  Financial Products and Services campaigns.
+
+- **Dependencies.** `@modelcontextprotocol/sdk` 1.29 → 1.30 (#108), which
+  adds the 10 MiB stdio read buffer, validates the request `Content-Type` by
+  parsed media type and sends SSE keep-alive frames. `@google-cloud/firestore`
+  8.5 → 9.1 (#149), whose only breaking change is the Node 22 requirement.
+  `jose` 6.1 → 6.2 (#148). Dev toolchain: vitest 4 → 5, plus eslint, tsx,
+  typescript-eslint and `@types/node` (#154). GitHub Actions pinned to new
+  SHAs (#104). The Dependabot config now ignores majors of typescript and
+  `@types/node` until their blockers move (#145), and majors of the Node
+  image, which move by hand together with `engines` (#156).
+
+### Upgrade notes
+
+Moving from v22.0 to v26.0 also brings Meta-side behaviour changes that need
+no code here but change delivery:
+
+- **v23.0**: new ad sets with default or relaxed targeting opt in to Advantage+
+  audience unless `advantage_audience` is set to `0`.
+- **v24.0**: daily budget flexibility rises from 25% to 75%, so a single day
+  can spend up to 75% over the daily budget while the weekly total stays
+  capped at seven times the daily budget. With ad set budget sharing on, both
+  caps grow by the shared amount: an ad set can spend up to
+  (daily budget + 20%) × 1.75 in a day and (daily budget + 20%) × 7 in a week.
+- **v26.0**: eligible new creatives default to
+  `destination_spec.destination_type = WEBSITE_AND_SHOP` when the advertiser
+  has a shop. `ads_create_ad_creative` and `ads_bulk_create_video_ads` do not
+  expose the `WEBSITE_AND_SHOP_OPT_OUT` opt-out yet.
+- **v26.0**: a creative meant for WhatsApp Status needs an explicit
+  `wamo_whatsapp_identity_spec`, which the creation tools do not expose yet.
+  Until they do, create those creatives in Ads Manager or with a direct Graph
+  call; the rebuild tools carry the identity over once it exists.
+- Marketing API versions ship about every four months, and Meta only
+  guarantees a replaced version for 90 days, so `DEFAULT_META_API_VERSION`
+  needs regular bumps, planned from the retirement dates Meta publishes. The
+  new warning log only confirms that a bump is already overdue.
+
+### Fixed
+
+- **The ffmpeg startup probe may run for 30 seconds without holding the port
+  for more than 10.** On a fresh Cloud Run node the first run of ffmpeg has
+  taken more than 10 seconds even with startup CPU, where a warm node answers
+  in about one; the likeliest reason is that Cloud Run streams image layers
+  on demand and the first execution waits for the layer that holds ffmpeg,
+  which is probable but not confirmed. Such an instance reported no `ffmpeg`
+  in `/health` until the first video call re-probed. The probe started at
+  boot now gets 30 seconds, but `listen` waits for it at most 10, as before:
+  with `min-instances` at zero a request is waiting on that cold start, so
+  the port is not held longer. If the probe is still running, it finishes in
+  the background and settles the answer when it completes; if it ends
+  inconclusively, killed at its timeout, the first video call re-probes after
+  the cooldown, as before. On-demand probes keep 10 seconds.
+- **Tool results over stdio are budgeted to fit the MCP SDK's read buffer.**
+  SDK 1.30.0 reads stdio through a buffer that, by default, closes the
+  transport on any single message above 10 MiB, and it does so on the client
+  side, where the tool result arrives. `inline` video advertised up to 50 MiB
+  over stdio; a client on that SDK could never have received it, the
+  connection would have dropped instead. The raw media budget for a whole
+  result over stdio is now 6 MiB, shared by everything in the message: the
+  inline video or the frames, the poster, and the images that
+  `ads_get_creative_media`, `ads_library_get_ad_details` and
+  `ads_get_ad_dossier` attach before the video part, which used to size their
+  images against the 30 MiB HTTP budget regardless of transport. Base64 adds
+  a third on top, and the JSON block shares the message too, which is what
+  the remaining room is for. HTTP budgets are unchanged, 20 MiB per inline
+  video and 30 MiB per result. Clients that raise the SDK's `maxBufferSize`
+  gain nothing here yet; the budget is a constant, not a setting.
+- **Cloud Run deploys are pinned to the second generation execution
+  environment.** Three consecutive deploys failed with nothing to go on: the
+  revision was created, instances started in a loop, no instance ever opened
+  port 3000, and the container produced not a single line of output, so Cloud
+  Run could only report the generic 240s startup-probe timeout. The three
+  merged changes are not what broke it: the last known good image, byte for
+  byte the one already serving production, failed to start the same way when
+  redeployed, while every other service in the same project and region kept
+  starting instances normally. What separates a revision that starts from one
+  that does not is the execution environment, which the workflow had left
+  unset for the platform to choose: with the in-memory `/tmp` volume mounted
+  and the choice left open the container never starts, and pinned to `gen2`
+  the same image answers `/health` in under half a second and reports ffmpeg
+  available. The root cause of the change in the unset behaviour on
+  2026-09-17 is not established here; only the fix is. Dropping the volume
+  would also let the container start, but the volume is what turns an
+  oversize scratch write into `ENOMEM` instead of a dead instance, so it
+  stays.
+- **A startup probe of ffmpeg that timed out was remembered as "no ffmpeg" for
+  the life of the instance.** The probe was spawned just before the port
+  opened and never awaited, so on Cloud Run it ran on into the window after
+  startup where the CPU is throttled until a request arrives; `ffmpeg -version`
+  then took longer than its own 10 second timeout, the failure was cached, and
+  every later `isAvailable()` call, in requests that did have CPU, returned the
+  stale answer. `/health` reported `ffmpeg: false` on a revision with ffmpeg
+  installed, and frame extraction, inline compaction and the Gemini compact
+  path all fell back for as long as that instance lived. The probe is now
+  awaited before `listen`, where startup CPU boost still applies, and a probe
+  that was killed on timeout or refused a resource is not remembered: after a
+  five second cooldown the next use asks again, so an instance under pressure
+  spawns at most one probe per cooldown rather than one per call. Only a
+  definitive answer is kept: the version string, a spawn error that says the
+  binary is not there or not executable, or a non-zero exit from the binary
+  itself. While no probe has been conclusive, `/health` omits the `ffmpeg`
+  key rather than guess, and the tools say the probe did not complete rather
+  than that ffmpeg is not installed.
+
+### Security
+
+- The advertiser's own ad copy in the dossier is delimited as untrusted content
+  and flattened to single lines with hyphen runs neutralized, like the Ad
+  Library card and the Gemini analysis before it. The brief is cut by whole
+  lines and never inside that fence, and the JSON block is reduced field by
+  field rather than truncated as a string, which would leave it unparseable.
+- The skill loader reads only `skills/<name>/SKILL.md` and
+  `skills/<name>/references/*.md`, with both path segments pattern-checked, a
+  256 KB per-file cap, a file-count cap, and `lstat` rather than `stat` so a
+  symlink planted in `skills/` cannot read anything else the process can.
+  Resources are registered under static URIs, so there is no path variable for
+  a traversal to hide in.
+- Prompt arguments are flattened to one bounded line before they reach the
+  message text, so an argument cannot forge structure around itself.
+
+
+- Gemini keys are stored encrypted at rest (AES-256-GCM) under their own AAD
+  namespace (`gemini_key:<user>:default`), so a ciphertext cannot be relocated
+  between users or between the Meta, Apify and Gemini collections. A decryption
+  failure propagates instead of degrading to "no key", which would fall through
+  to a shared fallback credential. `GEMINI_API_KEY` is honoured only in
+  single-tenant mode, and tenant resolution fails closed for an unidentified
+  multi-tenant caller.
+- The key travels only in the `x-goog-api-key` header, never in a URL, and is
+  not sent to the resumable-upload session URL, which is validated (https, exact
+  host, no port or credentials, `/upload/` path) before any video byte leaves.
+  File names and model ids are pattern-checked before interpolation, redirects
+  are refused, every response is read under a byte budget, and key-shaped
+  strings are scrubbed from errors and logs (`gemini_api_key`, `gemini_key`,
+  `x-goog-api-key` added to the logger's redaction paths).
+- A billable `generateContent` failure is never retried; the only retry is a
+  single schema-less attempt after a 400 that names the schema field, which
+  Google does not bill. A per-tenant hourly cap is refunded when the work ended
+  before the key was used and kept once it was.
+- Everything the model writes is delimited as untrusted content and flattened to
+  single lines with hyphen runs neutralized, so an analysis cannot forge the
+  fence that marks it as untrusted. The JSON block is reduced field by field
+  rather than truncated as a string, which would leave it unparseable.
+- `.gitleaks.toml` and the custom scanner gained rules for the `AQ.` key prefix
+  Google AI Studio has used since September 2026 and for any `GEMINI_API_KEY=`
+  assignment; the `AIza` rule alone would not have seen either.
+- Video downloads stream to a per-video scratch directory (never
+  `Buffer.concat`), tear rejected responses down instead of draining them,
+  honour the caller's abort signal from DNS onwards, and never echo scratch
+  paths or credentials in errors or metadata.
+- `ffmpeg` / `ffprobe` run through `execFile` (no shell) with
+  `-protocol_whitelist file`, a container format whitelist, native
+  `max_streams` / `max_pixels` / `max_alloc` caps, a single thread, output
+  size caps (`-fs`) and `SIGKILL` on timeout; every scale filter bounds both
+  output dimensions.
+- Resource limits: at most two video jobs per instance with a bounded queue
+  (aborted callers leave the queue immediately), a per-tenant hourly limit
+  with expired tenants purged, a per-call time budget under the Cloud Run
+  request timeout with partial results, and a 30 MB response byte budget shared
+  between images and video media. The HTTP transport now registers its
+  disconnect cleanup before handling a request so a dropped client aborts
+  in-flight tool handlers.
+- The image downloader also tears down rejected responses and accepts an
+  abort signal, so thumbnail fetches cancel with the job.
+
+### Migration
+
+Client-side notes, including what a client sees differently in the
+published schemas and what to do about the stdio budget, are in
+[docs/migration-v4.md](docs/migration-v4.md). The `register*Tools(server)`
+exports and every tool name are unchanged.
+
+### Compatibility
+
+- Node 22.13+.
+- `@modelcontextprotocol/sdk` ^1.30.
+- HTTP and stdio transports unchanged.
+- Per-user OAuth, System User token registry, server-to-server API key,
+  Firestore-backed encrypted token store: all unchanged.
+- ffmpeg optional; the Docker image includes it.
+
+## [3.6.0] — 2026-09-15
+
+### Added
+
+- **Apify tokens are now managed from the web UI**, not only by invoking
+  `ads_library_register_apify_token`. Asking an assistant to register a
+  credential was the only path, which is a poor fit for something users expect
+  to find next to their Meta tokens.
+  - A new **`GET /auth/connections`** page, authenticated and available at any
+    time, lists the stored Meta tokens (with the ability to switch the active
+    one) and the Apify connection, and allows registering, replacing or
+    disconnecting the Apify token. This is the page that solves rotation — the
+    consent screen only renders inside an OAuth flow, so it could never be
+    reached again after the initial approval.
+  - An **Apify section on the consent page** for first-time connection, plus a
+    link to the connections page. It deliberately offers no disconnect button:
+    dropping a credential mid-OAuth is not what the user came for.
+  - Apify stays optional. A test asserts the Approve button's disabled state
+    depends only on the Meta token count across all four
+    `tokens × apify` combinations.
+- Extracted the duplicated, unexported `escapeHtml` into `src/utils/html.ts`
+  (it existed byte-identically in `src/transport/http.ts` and
+  `src/transport/auth-routes.ts`) and the consent page's inline CSS into
+  `src/transport/html-pages.ts`, now shared by both surfaces.
+- **Meta Ad Library scraping via Apify — 8 new `ads_library_*` tools (127 → 135).**
+  Competitor ad research against the *public* Meta Ad Library, which the Graph
+  API does not expose. Backed by the
+  [curious_coder/facebook-ads-library-scraper](https://apify.com/curious_coder/facebook-ads-library-scraper)
+  actor.
+  - `ads_library_scrape` starts an asynchronous run from either a keyword
+    search (country / active status / ad type / search type) or a
+    facebook.com Ad Library or page URL, and returns a `run_id` +
+    `dataset_id`.
+  - `ads_library_get_run_status`, `ads_library_get_results` (paginated, with a
+    compact per-ad projection and a `raw` escape hatch), `ads_library_abort_run`
+    and `ads_library_list_runs` cover the rest of the run lifecycle.
+  - `ads_library_register_apify_token`, `ads_library_get_apify_token_status`
+    and `ads_library_delete_apify_token` manage the credential.
+- **Per-tenant Apify tokens, encrypted at rest** (`src/store/apify-token-repo.ts`).
+  Each user registers their own token; it is validated against the Apify API
+  *before* being persisted, then stored AES-256-GCM-encrypted in
+  `users/{fbUserId}/apify_tokens/default`. The GCM AAD is namespaced
+  `apify_token:{fbUserId}:default`, so a ciphertext cannot be relocated between
+  users or between the `meta_tokens` and `apify_tokens` collections.
+- **`src/apify/client.ts`** — a dedicated Apify API client with the same
+  timeout / retry / typed-error guarantees as `metaApiClient`. The token travels
+  in an `Authorization: Bearer` header (never a query param, so it cannot leak
+  into a logged URL), the base URL is not env-overridable, run/dataset ids are
+  validated before path interpolation, and every error message is scrubbed both
+  of `apify_api_*` substrings and of the exact token value in play.
+
+### Fixed
+
+- **`ads_library_scrape` no longer breaks Gemini clients.** Its `period`
+  parameter was published as `enum ["", "last24h", ...]`, and Gemini's
+  `function_declarations` reject any empty enum member, so every request
+  failed for a Gemini client with this server attached. The schema now
+  publishes only the four real values with the field optional, and the Apify
+  actor's `""` no-filter sentinel is applied when the actor input is built.
+  An explicit `""` from an existing client is still accepted. A new test
+  connects a real MCP client and asserts no published tool enum is empty or
+  contains `""` or `null` (#125).
+
+### Security
+
+- **`npm audit` clean again — 0 vulnerabilities.** Advisories published after
+  v3.5.0 had reappeared (5 moderate, 2 high). The ones reaching the production
+  runtime are `hono` 4.13.8 via the MCP SDK (path traversal in `toSSG()`,
+  unbounded nesting in `parseBody()`, query parsing past the URL fragment),
+  `fast-uri` 3.1.8 via ajv (SSRF and host confusion in URI normalization) and
+  `qs` 6.16.0 via express (array-limit bypass, DoS). Dev-only: `vitest`
+  4.1.11, `nanoid` 3.3.19 and `@humanfs/node` 0.16.8. Lockfile only, no
+  direct dependency range changed, no major bumps (#136).
+  Note for maintainers: `npm audit fix` crashes on npm 10.9.x with
+  `Cannot read properties of null (reading 'edgesOut')` (npm/cli#9787) while
+  resolving vitest 4.1.11's circular optional peers. Use npm 11 or later to
+  regenerate the lockfile; `npm ci` on npm 10 is unaffected.
+- `POST /auth/register-apify-token` validates the token against Apify's
+  `/v2/users/me` **before** persisting it, and never echoes it: the error page
+  shows a fixed string while the upstream message goes to the logs, and only
+  `hashToken()` / `hashPii()` are logged. `renderConnectionsPage` is tested to
+  never contain the stored token.
+- Input is rejected for control characters and inner whitespace, not just
+  length. The token is interpolated into an `Authorization: Bearer` header, so
+  an embedded CR/LF is a header-injection attempt and must fail before the
+  outbound call rather than relying on the HTTP client to notice.
+- Token validation uses a dedicated `ApifyApiClient({ timeout: 10_000,
+  maxRetries: 0 })` rather than the shared singleton (30s / 3 retries), so a
+  stalling `api.apify.com` cannot hold a user-facing request for minutes.
+- `/auth/register-apify-token` is rate limited (10 per 15 min) — the first
+  limiter on `/auth/*`, justified because each POST makes an outbound call to a
+  third party, which uncapped turns the endpoint into a credential-validation
+  oracle. It is registered **before** `mountAuthRoutes`, since Express matches
+  in registration order and a limiter added after the route would never run;
+  verified against the booted server (10× 401 then 429).
+- `validateMetaAuthReturn` was hard-wired to `/authorize`, so login could not
+  return to a non-OAuth page. Widened by an exact-string allowlist containing
+  only `/auth/connections`, compared **before** any URL parsing.
+- **Closed an open redirect** that the first version of that widening exposed.
+  `safeReturnTo` rejected `//` but not `/\`, and the WHATWG URL parser (like
+  browsers) normalizes `\` to `/` for special schemes — so
+  `/\evil.example/auth/connections` kept the expected `pathname` while
+  resolving to an external host, and a `pathname`-only check accepted it. The
+  pre-existing `/authorize` branch was accidentally shielded by its
+  client_id/redirect_uri requirement; the new standalone path had no such
+  shield. Fixed in three layers: reject backslashes outright, compare
+  standalone paths as exact strings before parsing, and pin `parsed.origin` to
+  the fixed base instead of trusting `pathname`. Covered by nine bypass tests.
+- The new POSTs validate request provenance via Fetch Metadata
+  (`Sec-Fetch-Site`), falling back to `Origin` compared against the origin the
+  browser actually contacted. `SameSite=Lax` blocks a cross-*site* POST, but
+  same-site is not same-origin — on a custom domain a sibling subdomain could
+  otherwise swap a tenant's Apify token for the attacker's and silently
+  redirect their scrapes. Requests carrying neither header are not browser form
+  posts and fall through to the session check.
+- A failure reading the Apify status no longer takes down the consent page.
+  Apify is an optional add-on, but `/authorize` had made `getStatus()` a hard
+  dependency inside `Promise.all`, so a storage hiccup would have blocked OAuth
+  approval entirely. It now degrades to "not connected" and logs.
+- `safeReturnTo` takes an optional fallback typed as a literal union, so a
+  caller can never route a user to an attacker-supplied destination.
+- `/auth/connections` sends a stricter CSP than the consent page (no external
+  `redirectOrigin`, plus `base-uri 'none'` and `frame-ancestors 'none'`), and
+  both pages now send `Cache-Control: no-store` and `Vary: Cookie` — the
+  consent page previously cached despite rendering token and Business Manager
+  names.
+- `fbUserId` on every new handler comes only from the session cookie, never
+  from the request body. Verified that the web route and the MCP tools resolve
+  the same tenant id, so the UI cannot write a token the tools would not read.
+- **The global gitleaks allowlist was silently far wider than written.**
+  gitleaks joins allowlist patterns into a single alternation (an optimization
+  promoted in 8.28.0), so an inline `(?i)` leaks into every pattern that follows
+  it. In practice that turned `test[-_]?(token|secret|key)` case-insensitive,
+  which exempted any credential containing an uppercase `TEST` — a real-looking
+  `apify_api_TESTtoken…` value passed a local scan while CI (then on 8.24.3)
+  correctly flagged it. The two spellings of `placeholder` in the list were the
+  tell that case-sensitivity had always been the intent.
+  This affects **`paths` as well as `regexes`**: a probe confirmed that a
+  leading `(?i)` entry made a following case-sensitive path pattern exclude
+  `SECRETS.NOTES` too, so a file that should have been scanned was skipped
+  outright. Every pattern in both lists now declares `(?i)` or `(?-i)`
+  explicitly, so they mean the same thing on every gitleaks version regardless
+  of ordering.
+- The local guard scripts now **fail closed** around their own preconditions.
+  Previously a missing gitleaks binary was a `[SKIP]`, and a missing, empty or
+  non-semver `.gitleaks-version` silently disabled the version check — a green
+  run that reads as evidence the scan happened. All five states (no pin, empty
+  pin, non-semver pin, unreadable `gitleaks version`, binary absent) are now
+  blocking failures.
+- Pinned the scanner version in [.gitleaks-version](.gitleaks-version), read by
+  both [ci.yml](.github/workflows/ci.yml) and the local guard scripts, which
+  now fail on a mismatch instead of letting a green local run imply a green CI.
+  The workflow validates the pin is a bare semver before it reaches
+  `GITHUB_ENV`, since it is checked-out repo content.
+- Added `tests/gitleaks-config.test.ts` to keep the case-flag convention from
+  regressing: it asserts every allowlist regex declares its flag, that the
+  fixture exemptions stay case-sensitive, and that the `apify-api-token` rule
+  still matches a production-shaped token while ignoring the repo's short
+  fixtures.
+- **Tenant isolation fails closed.** In multi-tenant mode (Meta OAuth app
+  configured, HTTP transport) a caller with no OAuth identity — an API-key
+  request, or any flow that loses `fbUserId` — is refused rather than bucketed
+  into a shared credential. The `APIFY_TOKEN` environment variable is honoured
+  **only** in single-tenant mode (stdio, or no Meta app configured); it is
+  never used as a cross-tenant fallback, so one advertiser's scrapes can never
+  be billed to the operator's Apify account.
+- A stored token that fails authenticated decryption (GCM tag mismatch from a
+  relocated document, key rotation, or tampering) raises an error instead of
+  being reported as "no token" — degrading an integrity failure to absence
+  would have fallen through to a fallback credential.
+- Cost reporting derives from `chargedEventCounts` when Apify has not yet
+  settled `usageTotalUsd`. Verified against the live API: a run that has just
+  flipped to `SUCCEEDED` still reports `usageTotalUsd: 0` for a few seconds,
+  so a caller polling to completion would have been told a billable scrape was
+  free. The charged event count is accurate immediately.
+- Cost containment: each scrape sends Apify a hard `maxTotalChargeUsd` cap
+  derived from the requested `count`. The actor bills PAY_PER_EVENT
+  ($0.00075/ad), so Apify aborts the run server-side rather than billing past
+  the cap; `count` is additionally capped at 2,000 per call. Note this bounds
+  each *run*, not a tenant's aggregate spend — a client can still start many
+  runs, each against its own Apify account and credit.
+- `POST` is never retried automatically, which removes the client-side
+  duplicate-run path. It does **not** make double billing impossible: Apify can
+  accept a run and lose the response, so a timed-out start is *indeterminate*.
+  The timeout message says so and points at `ads_library_list_runs` to check
+  before retrying.
+- `ads_library_scrape` accepts URLs only over https on an exact `facebook.com`
+  host allowlist, and additionally rejects embedded credentials, non-default
+  ports, and Facebook's outbound redirect endpoints (`/l.php` and friends) that
+  would send the scraper off-site.
+- Added an `apify-api-token` rule to [.gitleaks.toml](.gitleaks.toml).
+- Pino now has a `redact` configuration (previously none at all) covering
+  token- and authorization-shaped keys, as defense in depth behind the existing
+  call-site hashing/masking convention.
+
 ## [3.5.0] — 2026-08-09
 
 ### Security

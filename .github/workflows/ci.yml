@@ -19,12 +19,12 @@ jobs:
     timeout-minutes: 15
     steps:
       - name: Checkout
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v4
 
       - name: Setup Node.js
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020  # v7.0.0
         with:
-          node-version: '20'
+          node-version: '22'
           cache: 'npm'
 
       - name: Install dependencies
@@ -39,9 +39,13 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
 
+      - name: Install ffmpeg (video keyframe tests)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+
       - name: Test
         env:
           CI: '1'
+          FFMPEG_REQUIRED: '1'
         run: npm test
 
       - name: Build
@@ -65,14 +69,33 @@ jobs:
 
       - name: Checkout
         if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v4
         with:
           fetch-depth: 0
 
+      # Single source of truth for the scanner version, shared with the local
+      # guard in .github/pre-deploy-guard/. Left unpinned, the action supplies
+      # its own default (8.24.3), which drifts from whatever contributors have
+      # installed — and gitleaks versions genuinely disagree about allowlist
+      # semantics, so a green local scan stopped predicting CI.
+      - name: Resolve pinned gitleaks version
+        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+        run: |
+          version="$(tr -d '[:space:]' < .gitleaks-version)"
+          # .gitleaks-version is checked-out repo content, so treat it as
+          # untrusted before it reaches GITHUB_ENV: anything but a bare
+          # x.y.z could smuggle extra variables into the job environment.
+          if ! printf '%s' "$version" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "::error::.gitleaks-version must contain a bare semver (got: $version)"
+            exit 1
+          fi
+          echo "GITLEAKS_VERSION=$version" >> "$GITHUB_ENV"
+
       - name: Run gitleaks
         if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
-        uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7  # v2
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e  # v3.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
           GITLEAKS_CONFIG: .gitleaks.toml
+          GITLEAKS_VERSION: ${{ env.GITLEAKS_VERSION }}

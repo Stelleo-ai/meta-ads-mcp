@@ -9,11 +9,24 @@ import { mcpAuthRouter } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
 import { oauthProvider } from "../auth/oauth-provider.js";
 import { isApiKeyConfigured, validateApiKey } from "../auth/api-key.js";
-import { requestContext } from "../auth/token-store.js";
+import { hashPii, requestContext } from "../auth/token-store.js";
 import { tokenManager } from "../auth/token-manager.js";
 import { configureSessionJtiStore, getSession } from "../auth/session.js";
 import { resolveSecurityConfig } from "./security-config.js";
 import { mountAuthRoutes, safeReturnTo } from "./auth-routes.js";
+import { escapeHtml } from "../utils/html.js";
+import {
+  CONNECTIONS_PATH,
+  PAGE_STYLES,
+  renderApifySection,
+  renderGeminiSection,
+  userInitials,
+} from "./html-pages.js";
+import { getApifyTokenRepo } from "../store/apify-token-repo.js";
+import { getGeminiKeyRepo } from "../store/gemini-key-repo.js";
+import type { GeminiKeyStatus } from "../store/gemini-key-repo.js";
+import type { ApifyTokenStatus } from "../store/apify-token-repo.js";
+
 import { validateAuthorizeQuery } from "./authorize-validation.js";
 import {
   FirestoreClientsStore,
@@ -39,6 +52,9 @@ import {
 import { isFirestoreEnabled } from "../store/firestore.js";
 import { logger } from "../utils/logger.js";
 import { unsafeIpReason } from "../utils/url-guard.js";
+import { STARTUP_VERSION_PROBE_TIMEOUT_MS, getFfmpeg } from "../media/ffmpeg.js";
+import { withDeadline } from "../utils/with-deadline.js";
+import { sweepStaleVideoDirs } from "../media/video-jobs.js";
 
 interface PendingAuth {
   fbUserId: string;
@@ -46,14 +62,16 @@ interface PendingAuth {
 
 const pendingAuthStorage = new AsyncLocalStorage<PendingAuth>();
 
-function escapeHtml(raw: string): string {
-  return raw
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;")
-    .replace(/'/g, "&#x27;");
-}
+/** Rendered when the Apify status cannot be read — the section degrades, OAuth continues. */
+const UNKNOWN_APIFY_STATUS: ApifyTokenStatus = {
+  registered: false,
+  apifyUserId: null,
+  apifyUsername: null,
+  updatedAt: null,
+};
+
+/** Same degradation for the Gemini key: the section disappears, OAuth continues. */
+const UNKNOWN_GEMINI_STATUS: GeminiKeyStatus = { registered: false, keyFingerprint: null, updatedAt: null };
 
 function normalizeHostname(hostname: string): string {
   return hostname.startsWith("[") && hostname.endsWith("]")
@@ -101,8 +119,8 @@ export function getServerUrl(): URL {
   return new URL(`http://localhost:${port}`);
 }
 
-export function healthPayload(): { status: "ok" } {
-  return { status: "ok" };
+export function healthPayload(extras: { ffmpeg?: boolean } = {}): { status: "ok"; ffmpeg?: boolean } {
+  return extras.ffmpeg === undefined ? { status: "ok" } : { status: "ok", ffmpeg: extras.ffmpeg };
 }
 
 interface ConsentContext {
@@ -110,9 +128,11 @@ interface ConsentContext {
   user: { fbUserId: string; email: string | null; name: string | null };
   tokens: Awaited<ReturnType<typeof listTokens>>;
   activeName: string | null;
+  apify: ApifyTokenStatus;
+  gemini: GeminiKeyStatus;
 }
 
-function renderConsentPage(ctx: ConsentContext): string {
+export function renderConsentPage(ctx: ConsentContext): string {
   const clientId = escapeHtml(ctx.query.client_id || "Unknown");
   const hiddenFields = Object.entries(ctx.query)
     .map(
@@ -154,13 +174,7 @@ function renderConsentPage(ctx: ConsentContext): string {
           .join("\n")
       : `<p class="no-tokens">No hay tokens conectados. Pega un System User token abajo o cierra sesión y vuelve a iniciar.</p>`;
 
-  const userInitials = (ctx.user.name ?? ctx.user.email ?? "?")
-    .split(/\s+/)
-    .map((part) => part[0])
-    .filter(Boolean)
-    .slice(0, 2)
-    .join("")
-    .toUpperCase();
+  const initials = userInitials(ctx.user);
 
   return `<!DOCTYPE html>
 <html lang="es">
@@ -169,50 +183,13 @@ function renderConsentPage(ctx: ConsentContext): string {
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Autorizar — Meta Ads MCP</title>
   <style>
-    *{margin:0;padding:0;box-sizing:border-box}
-    body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0f0f0f;color:#e0e0e0;display:flex;justify-content:center;align-items:center;min-height:100vh;padding:1rem}
-    .card{background:#1a1a1a;border:1px solid #333;border-radius:12px;padding:2rem;max-width:520px;width:100%}
-    .user{display:flex;align-items:center;gap:0.75rem;padding-bottom:1rem;border-bottom:1px solid #2a2a2a;margin-bottom:1.5rem}
-    .avatar{width:40px;height:40px;border-radius:50%;background:#2563eb;color:#fff;display:flex;align-items:center;justify-content:center;font-weight:600}
-    .user-info{flex:1;min-width:0}
-    .user-name{color:#fff;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-    .user-email{color:#888;font-size:0.85rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-    .logout{background:transparent;border:1px solid #333;color:#888;padding:0.4rem 0.75rem;border-radius:6px;font-size:0.8rem;cursor:pointer}
-    .logout:hover{border-color:#555;color:#ccc}
-    h1{font-size:1.3rem;color:#fff;margin-bottom:0.5rem}
-    .subtitle{color:#888;margin-bottom:1.5rem;font-size:0.95rem}
-    .client{color:#6cb4ee;font-weight:600}
-    .section{margin-bottom:1.5rem}
-    .section-title{color:#aaa;font-size:0.8rem;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:0.5rem}
-    .permissions{background:#111;border-radius:8px;padding:0.75rem 1rem}
-    .permissions li{margin:0.3rem 0;color:#aaa;font-size:0.9rem;list-style:none}
-    .token-row{display:flex;align-items:center;gap:0.5rem;padding:0.6rem 0.75rem;background:#111;border:1px solid #2a2a2a;border-radius:6px;margin-bottom:0.4rem;cursor:pointer}
-    .token-row.active{border-color:#2563eb}
-    .token-name{flex:1;color:#e0e0e0;font-size:0.9rem;font-weight:500}
-    .token-expiry{color:#666;font-size:0.8rem}
-    .badge{background:#222;color:#888;padding:0.1rem 0.4rem;border-radius:4px;font-size:0.7rem;text-transform:uppercase}
-    .badge-warn{background:#3b1111;color:#fca5a5}
-    .badge-bm{background:#1a2f3f;color:#6cb4ee;text-transform:none;max-width:14ch;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-    .no-tokens{color:#888;background:#111;border-radius:8px;padding:1rem;text-align:center;font-size:0.9rem}
-    details{background:#111;border-radius:8px;padding:0.75rem 1rem;margin-bottom:1rem}
-    details summary{cursor:pointer;color:#6cb4ee;font-size:0.9rem}
-    details[open] summary{margin-bottom:0.75rem}
-    details input[type="text"],details input[type="password"]{width:100%;padding:0.5rem 0.75rem;background:#0a0a0a;border:1px solid #333;border-radius:6px;color:#e0e0e0;margin-bottom:0.5rem}
-    details button{padding:0.5rem 1rem;background:#333;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:0.85rem}
-    details button:hover{background:#444}
-    button.approve,button.deny{width:100%;padding:0.75rem;border:none;border-radius:8px;font-size:1rem;font-weight:600;cursor:pointer;margin-top:0.5rem}
-    .approve{background:#2563eb;color:#fff}
-    .approve:hover{background:#1d4ed8}
-    .approve:disabled{background:#444;cursor:not-allowed}
-    .deny{background:#222;color:#aaa}
-    .deny:hover{background:#333}
-    .inline{display:inline}
+${PAGE_STYLES}
   </style>
 </head>
 <body>
   <div class="card">
     <div class="user">
-      <div class="avatar">${escapeHtml(userInitials || "U")}</div>
+      <div class="avatar">${escapeHtml(initials || "U")}</div>
       <div class="user-info">
         <div class="user-name">${escapeHtml(ctx.user.name ?? "Usuario Meta")}</div>
         <div class="user-email">${escapeHtml(ctx.user.email ?? ctx.user.fbUserId)}</div>
@@ -251,6 +228,12 @@ function renderConsentPage(ctx: ConsentContext): string {
         <button type="submit">Validar y guardar</button>
       </form>
     </details>
+
+    ${renderApifySection({ status: ctx.apify, returnTo: fullPath, variant: "consent" })}
+
+    ${renderGeminiSection({ status: ctx.gemini, returnTo: fullPath, variant: "consent" })}
+
+    <a class="manage-link" href="${CONNECTIONS_PATH}">Gestionar conexiones →</a>
 
     <form id="approve-form" method="POST" action="/authorize">
       ${hiddenFields}
@@ -508,11 +491,66 @@ export async function startHttpTransport(
     }
   }
 
+  // Started before the port opens, so it gets startup CPU, and waited for a
+  // bounded time only: with min-instances at zero, a request that caused
+  // this cold start is waiting on listen, and every second here is a second
+  // added to it. On a warm node the probe answers in about a second. On a
+  // fresh node the first run of ffmpeg has taken more than 10 s even with
+  // CPU, most likely because Cloud Run streams image layers on demand and
+  // the first execution waits for the layer that holds it. For that case
+  // the probe itself gets 30 s and is left to finish in the background
+  // after listen; it settles the answer when it completes, and if it ends
+  // inconclusively, killed at its timeout, the first video call re-probes
+  // after the cooldown. The health check reads the settled answer and never
+  // spawns a process per request.
+  const STARTUP_PROBE_WAIT_MS = 10_000;
+  const ffmpegRuntime = getFfmpeg();
+  const startupProbe = ffmpegRuntime.isAvailable({ timeoutMs: STARTUP_VERSION_PROBE_TIMEOUT_MS });
+  const logProbeOutcome = (phase: "at startup" | "after listen"): void => {
+    const known = ffmpegRuntime.lastKnownAvailability();
+    if (known === undefined) {
+      logger.warn(
+        { timeout_ms: STARTUP_VERSION_PROBE_TIMEOUT_MS, phase },
+        "ffmpeg startup probe was inconclusive (killed on timeout, or the spawn was refused for want of a resource); it will be retried on the first use after a short cooldown",
+      );
+    } else {
+      logger.info(
+        { ffmpeg_available: known, phase },
+        known ? "ffmpeg detected; video keyframe extraction enabled" : "ffmpeg not found; video tools fall back to thumbnails",
+      );
+    }
+  };
+  const waited = await withDeadline(startupProbe, STARTUP_PROBE_WAIT_MS);
+  if (waited.settled) {
+    logProbeOutcome("at startup");
+  } else {
+    logger.info({ waited_ms: STARTUP_PROBE_WAIT_MS }, "ffmpeg startup probe still running; opening the port and letting it finish in the background");
+    void startupProbe.then(() => logProbeOutcome("after listen"));
+  }
+  void sweepStaleVideoDirs().then((removed) => {
+    if (removed > 0) logger.info({ removed }, "Removed stale video scratch directories");
+  });
+
   app.get("/health", (_req, res) => {
-    res.json(healthPayload());
+    res.json(healthPayload({ ffmpeg: ffmpegRuntime.lastKnownAvailability() }));
   });
 
   if (config.multiTenantEnabled) {
+    // Registered BEFORE mountAuthRoutes on purpose: Express matches in
+    // registration order, so a limiter added after the route handler would
+    // never run. Each POST makes an outbound api.apify.com call, which without
+    // a cap turns the endpoint into a credential-validation oracle against a
+    // third party.
+    app.use(
+      "/auth/register-apify-token",
+      createRateLimiter(10, 15 * 60 * 1000),
+    );
+    // Same reasoning for the Gemini key: each POST calls generativelanguage.googleapis.com.
+    app.use(
+      "/auth/register-gemini-key",
+      createRateLimiter(10, 15 * 60 * 1000),
+    );
+
     mountAuthRoutes(app, {
       serverUrl,
       getClient: (id) => oauthProvider.clientsStore.getClient(id),
@@ -561,13 +599,47 @@ export async function startHttpTransport(
         return;
       }
 
-      const tokens = await listTokens(session.fbUserId);
-      const activeName = await getDefaultTokenName(session.fbUserId);
+      const [tokens, activeName, apify, gemini] = await Promise.all([
+        listTokens(session.fbUserId),
+        getDefaultTokenName(session.fbUserId),
+        // Apify and Gemini are optional add-ons, so a failure reading their
+        // status must not take down OAuth approval. Degrade to "not connected".
+        getApifyTokenRepo()
+          .getStatus(session.fbUserId)
+          .catch((error: unknown) => {
+            logger.warn(
+              {
+                event: "apify_status_unavailable",
+                fbUserId: hashPii(session.fbUserId),
+                error: error instanceof Error ? error.message : String(error),
+              },
+              "Could not read Apify status; rendering consent without it",
+            );
+            return UNKNOWN_APIFY_STATUS;
+          }),
+        getGeminiKeyRepo()
+          .getStatus(session.fbUserId)
+          .catch((error: unknown) => {
+            logger.warn(
+              {
+                event: "gemini_status_unavailable",
+                fbUserId: hashPii(session.fbUserId),
+                error: error instanceof Error ? error.message : String(error),
+              },
+              "Could not read Gemini key status; rendering consent without it",
+            );
+            return UNKNOWN_GEMINI_STATUS;
+          }),
+      ]);
 
       res.setHeader(
         "Content-Security-Policy",
         `default-src 'none'; style-src 'unsafe-inline'; form-action 'self' ${redirectOrigin}`,
       );
+      // The page renders token names, Business Manager names and the Apify
+      // account — none of it belongs in a shared or back-button cache.
+      res.setHeader("Cache-Control", "no-store");
+      res.setHeader("Vary", "Cookie");
 
       res.type("html").send(
         renderConsentPage({
@@ -579,6 +651,8 @@ export async function startHttpTransport(
           },
           tokens,
           activeName,
+          apify,
+          gemini,
         }),
       );
     });
@@ -651,12 +725,20 @@ export async function startHttpTransport(
       const server = createServer();
       await server.connect(transport);
 
-      await transport.handleRequest(req, res, req.body);
-
-      res.on("close", () => {
+      // Registered before handling so a client disconnect mid-request closes the
+      // transport, which aborts every in-flight tool handler via extra.signal
+      // (video downloads / ffmpeg jobs must not outlive their caller).
+      const cleanup = () => {
         transport.close().catch(() => {});
         server.close().catch(() => {});
-      });
+      };
+      if (res.destroyed) {
+        cleanup();
+        return;
+      }
+      res.once("close", cleanup);
+
+      await transport.handleRequest(req, res, req.body);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       logger.error({ error: message }, "Error handling MCP request");
