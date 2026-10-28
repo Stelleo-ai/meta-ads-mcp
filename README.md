@@ -616,6 +616,7 @@ This server is designed to keep your app and your clients' ad accounts clear of 
 - Wide date ranges (`maximum`, `>90 days`) + breakdowns on a sync call → rejected, pointing at `ads_run_report_and_wait`.
 - `time_range` > 37 months → rejected.
 - `use_unified_attribution_setting=true` by default so responses match Ads Manager (Meta change, 2025-06-10).
+- `action_report_time` (optional, `ads_get_insights`) picks the day a conversion is counted on: `impression` (day the ad was seen) or `conversion` (day it happened). Omitted, Meta's default applies.
 - `filtering` parameter exposed and recommended (e.g. `ad.impressions > 0`) to skip empty objects.
 
 ### Observability

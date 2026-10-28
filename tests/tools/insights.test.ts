@@ -62,7 +62,7 @@ describe("registerInsightsTools", () => {
       }) as { content: Array<{ type: string; text: string }> };
 
       expect(result.content[0].text).toContain("2024-01-01");
-      expect(result.content[0].text).toContain("50,000");
+      expect(result.content[0].text).toContain((50000).toLocaleString());
       expect(result.content[0].text).toContain("$250.50");
     });
 
@@ -123,6 +123,41 @@ describe("registerInsightsTools", () => {
 
       expect(result.content[0].text).toContain("link_click");
       expect(result.content[0].text).toContain("purchase");
+    });
+
+    it("passes action_report_time to Meta when given", async () => {
+      const server = createMockMcpServer();
+      registerInsightsTools(server as never);
+
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(mockFetchResponse({ data: [] })));
+
+      const handler = server._registeredTools[0].handler;
+      await handler({
+        object_id: "act_100123",
+        date_preset: "last_7d",
+        action_report_time: "impression",
+        limit: 100,
+      });
+
+      const url = new URL(vi.mocked(fetch).mock.calls[0][0] as string);
+      expect(url.searchParams.get("action_report_time")).toBe("impression");
+    });
+
+    it("leaves action_report_time out when not given", async () => {
+      const server = createMockMcpServer();
+      registerInsightsTools(server as never);
+
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue(mockFetchResponse({ data: [] })));
+
+      const handler = server._registeredTools[0].handler;
+      await handler({
+        object_id: "act_100123",
+        date_preset: "last_7d",
+        limit: 100,
+      });
+
+      const url = new URL(vi.mocked(fetch).mock.calls[0][0] as string);
+      expect(url.searchParams.has("action_report_time")).toBe(false);
     });
   });
 });

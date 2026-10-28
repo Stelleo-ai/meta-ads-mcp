@@ -7,6 +7,14 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Added
+
+- **`ads_get_insights` takes an optional `action_report_time`.** It tells
+  Meta which day a conversion is counted on: `impression` (the day the ad
+  was seen) or `conversion` (the day the conversion happened), plus `mixed`
+  and `lifetime`. The value is passed to the Graph API as given. Without it
+  the request is unchanged and Meta's default applies.
+
 ### Fixed
 
 - **`ads_upload_ad_image` names the image after the `name` argument.** Meta

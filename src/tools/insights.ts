@@ -31,6 +31,8 @@ const breakdownEnum = z.enum([
 
 const attributionWindowEnum = z.enum(["1d_click", "7d_click", "1d_view", "28d_click"]);
 
+const actionReportTimeEnum = z.enum(["impression", "conversion", "mixed", "lifetime"]);
+
 const levelEnum = z.enum(["ad", "adset", "campaign", "account"]);
 
 const filteringEntrySchema = z.object({
@@ -66,6 +68,9 @@ export function registerInsightsTools(server: McpServer): void {
         breakdowns: z.array(breakdownEnum).optional().describe("Breakdown dimensions. Avoid product_id / asset-level on account-wide queries."),
         fields: z.array(z.string()).optional().describe("Metrics to retrieve (defaults to standard set)"),
         action_attribution_windows: z.array(attributionWindowEnum).optional(),
+        action_report_time: actionReportTimeEnum
+          .optional()
+          .describe("Day a conversion is reported on: 'impression' = day the ad was seen, 'conversion' = day the conversion happened. Also 'mixed' or 'lifetime'. Omit to keep Meta's API default."),
         use_unified_attribution_setting: z
           .boolean()
           .default(true)
@@ -87,8 +92,8 @@ export function registerInsightsTools(server: McpServer): void {
     },
     async ({
       object_id, level, time_range, date_preset, breakdowns,
-      fields, action_attribution_windows, use_unified_attribution_setting,
-      filtering, time_increment, limit,
+      fields, action_attribution_windows, action_report_time,
+      use_unified_attribution_setting, filtering, time_increment, limit,
     }) => {
       const objectId = validateMetaId(object_id, "object");
       enforceInsightsGuardrails({
@@ -115,6 +120,7 @@ export function registerInsightsTools(server: McpServer): void {
       if (action_attribution_windows && action_attribution_windows.length > 0) {
         params.action_attribution_windows = JSON.stringify(action_attribution_windows);
       }
+      if (action_report_time) params.action_report_time = action_report_time;
       if (filtering && filtering.length > 0) {
         params.filtering = JSON.stringify(filtering);
       }
